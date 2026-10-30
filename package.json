@@ -1,0 +1,123 @@
+{
+  "name": "sfa-studio",
+  "productName": "SFA Studio",
+  "version": "1.0.0",
+  "description": "Free, open-source layered photo editor by SFA.",
+  "author": "SFA <polanxy@gmail.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/bbeaudroit/sfa-studio",
+  "repository": "github:bbeaudroit/sfa-studio",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite --port 5181",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --port 5181",
+    "electron": "concurrently -k -n vite,app -c gray,green \"vite --host 127.0.0.1 --port 5181 --strictPort\" \"wait-on tcp:127.0.0.1:5181 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5181 electron .\"",
+    "electron:prod": "npm run build && electron .",
+    "icons": "electron scripts/make-art.cjs",
+    "shots": "electron scripts/screenshots.cjs",
+    "dist": "npm run build && electron-builder --win nsis",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "dependencies": {
+    "@fontsource-variable/geist": "^5.3.0",
+    "@fontsource-variable/geist-mono": "^5.3.0",
+    "fflate": "^0.8.3",
+    "lucide-react": "^1.65.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "zustand": "^5.0.16"
+  },
+  "build": {
+    "appId": "com.sfa.studio",
+    "productName": "SFA Studio",
+    "copyright": "Copyright © 2026 SFA",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "SFA Studio",
+      "menuCategory": "SFA",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "installerSidebar": "build/installerSidebar.bmp",
+      "uninstallerSidebar": "build/uninstallerSidebar.bmp",
+      "installerHeader": "build/installerHeader.bmp",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "license": "LICENSE",
+      "artifactName": "SFA-Studio-Setup.${ext}"
+    },
+    "fileAssociations": [
+      {
+        "ext": "sfas",
+        "name": "SFA Studio Project",
+        "description": "SFA Studio Project",
+        "icon": "build/project.ico",
+        "role": "Editor"
+      },
+      {
+        "ext": "png",
+        "name": "PNG Image",
+        "role": "Editor"
+      },
+      {
+        "ext": [
+          "jpg",
+          "jpeg"
+        ],
+        "name": "JPEG Image",
+        "role": "Editor"
+      },
+      {
+        "ext": "webp",
+        "name": "WebP Image",
+        "role": "Editor"
+      }
+    ]
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^10.0.6",
+    "cross-env": "^10.1.0",
+    "electron": "^45.2.0",
+    "electron-builder": "^26.18.0",
+    "png-to-ico": "^3.0.2",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "wait-on": "^9.5.1"
+  },
+  "allowScripts": {
+    "electron@45.2.0": true
+  }
+}
