@@ -2,7 +2,7 @@ import { AlignCenter, AlignLeft, AlignRight, FlipHorizontal2, FlipVertical2, Ita
 import { useMemo, useRef, useState } from 'react'
 import { adjustmentLabel, curveLut, defaultAdjustment, histogram } from '../../core/adjustments'
 import { ctx2d, makeCanvas } from '../../core/bitmap'
-import { flipLayer, rasterize } from '../../core/ops'
+import { applyMask, deleteMask, flipLayer, rasterize, toggleClip, toggleMask } from '../../core/ops'
 import { compositeLayers } from '../../core/render'
 import { S, commit, set, useStore } from '../../core/store'
 import type { RasterLayer, AdjustLayer, Adjustment, CurvePoints, Doc, Layer, ShapeLayer, TextLayer } from '../../core/types'
@@ -34,7 +34,83 @@ export function PropertiesPanel() {
       {layer.kind === 'text' && <TextProps layer={layer} key={layer.id} />}
       {layer.kind === 'shape' && <ShapeProps layer={layer} key={layer.id} />}
       {layer.kind === 'raster' && <RasterProps layer={layer} key={layer.id} />}
+      <LayerExtras layer={layer} key={`x-${layer.id}`} />
     </div>
+  )
+}
+
+// --- Mask, clipping, effects (all layer kinds) -------------------------------------
+
+const FX_DEFAULTS = {
+  shadow: { on: true, color: '#000000', opacity: 0.55, angle: 120, distance: 12, size: 18 },
+  glow: { on: true, color: '#ffffff', opacity: 0.6, size: 22 },
+  stroke: { on: true, color: '#ffffff', opacity: 1, size: 4 },
+}
+
+function LayerExtras({ layer }: { layer: Layer }) {
+  const live = useLive(layer.id)
+  const editMask = useStore(s => s.editMask)
+  const fx = layer.fx ?? {}
+  type K = keyof typeof FX_DEFAULTS
+  const setFx = (k: K, patch: Record<string, unknown> | null, label?: string) => {
+    const cur = (fx[k] ?? FX_DEFAULTS[k]) as unknown as Record<string, unknown>
+    live.change({ fx: { ...fx, [k]: patch === null ? { ...cur, on: !cur.on } : { ...cur, ...patch } } })
+    if (label) live.done(label)
+  }
+  const row = (k: K, title: string, body: React.ReactNode) => {
+    const on = !!fx[k]?.on
+    return (
+      <div className="rounded-lg border border-white/6 bg-ink-850">
+        <div className="flex h-8 items-center px-2">
+          <Check label={title} checked={on} onChange={() => setFx(k, null, on ? `Hide ${title.toLowerCase()}` : title)} />
+        </div>
+        {on && <div className="space-y-2 px-2 pb-2.5">{body}</div>}
+      </div>
+    )
+  }
+  const sh = { ...FX_DEFAULTS.shadow, ...fx.shadow }
+  const gl = { ...FX_DEFAULTS.glow, ...fx.glow }
+  const st = { ...FX_DEFAULTS.stroke, ...fx.stroke }
+  return (
+    <>
+      {layer.mask && (
+        <div className="space-y-2 rounded-lg border border-white/6 bg-ink-850 p-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[11.5px] text-ink-200">Mask</span>
+            <Segmented value={editMask ? 'mask' : 'layer'} onChange={v => set({ editMask: v === 'mask' })} options={[{ id: 'layer', label: layer.kind === 'adjust' ? 'Settings' : 'Pixels' }, { id: 'mask', label: 'Mask' }]} />
+          </div>
+          <div className="flex gap-1.5">
+            <Btn onClick={() => toggleMask(layer.id)} className="h-7 flex-1 px-2 text-[11.5px]">{layer.mask.enabled ? 'Disable' : 'Enable'}</Btn>
+            {layer.kind !== 'adjust' && <Btn onClick={applyMask} className="h-7 flex-1 px-2 text-[11.5px]">Apply</Btn>}
+            <Btn onClick={() => deleteMask(layer.id)} className="h-7 flex-1 px-2 text-[11.5px]">Delete</Btn>
+          </div>
+          {editMask && <div className="text-[11px] text-ink-400">Paint black to hide, white to show.</div>}
+        </div>
+      )}
+      <Check label="Clip to layer below" checked={!!layer.clip} onChange={() => toggleClip(layer.id)} tip="Clipping mask (Ctrl+Alt+G)" />
+      {layer.kind !== 'adjust' && (
+        <div className="space-y-1.5">
+          <Label>Effects</Label>
+          {row('shadow', 'Drop shadow', <>
+            <div className="flex items-center gap-2"><span className="w-20 text-ink-300">Color</span><ColorSwatch value={sh.color} onChange={c => setFx('shadow', { color: c })} onDone={() => live.done('Shadow color')} size={22} /></div>
+            <Slider label="Opacity" value={Math.round(sh.opacity * 100)} min={0} max={100} unit="%" onChange={v => setFx('shadow', { opacity: v / 100 })} onCommit={() => live.done('Drop shadow')} wide />
+            <Slider label="Angle" value={sh.angle} min={-180} max={180} unit="°" onChange={v => setFx('shadow', { angle: v })} onCommit={() => live.done('Drop shadow')} wide />
+            <Slider label="Distance" value={sh.distance} min={0} max={200} unit="px" onChange={v => setFx('shadow', { distance: v })} onCommit={() => live.done('Drop shadow')} wide />
+            <Slider label="Size" value={sh.size} min={0} max={150} unit="px" onChange={v => setFx('shadow', { size: v })} onCommit={() => live.done('Drop shadow')} wide />
+          </>)}
+          {row('glow', 'Outer glow', <>
+            <div className="flex items-center gap-2"><span className="w-20 text-ink-300">Color</span><ColorSwatch value={gl.color} onChange={c => setFx('glow', { color: c })} onDone={() => live.done('Glow color')} size={22} /></div>
+            <Slider label="Opacity" value={Math.round(gl.opacity * 100)} min={0} max={100} unit="%" onChange={v => setFx('glow', { opacity: v / 100 })} onCommit={() => live.done('Outer glow')} wide />
+            <Slider label="Size" value={gl.size} min={1} max={150} unit="px" onChange={v => setFx('glow', { size: v })} onCommit={() => live.done('Outer glow')} wide />
+          </>)}
+          {row('stroke', 'Stroke', <>
+            <div className="flex items-center gap-2"><span className="w-20 text-ink-300">Color</span><ColorSwatch value={st.color} onChange={c => setFx('stroke', { color: c })} onDone={() => live.done('Stroke color')} size={22} /></div>
+            <Slider label="Opacity" value={Math.round(st.opacity * 100)} min={0} max={100} unit="%" onChange={v => setFx('stroke', { opacity: v / 100 })} onCommit={() => live.done('Stroke')} wide />
+            <Slider label="Size" value={st.size} min={1} max={60} unit="px" onChange={v => setFx('stroke', { size: v })} onCommit={() => live.done('Stroke')} wide />
+          </>)}
+        </div>
+      )}
+    </>
   )
 }
 

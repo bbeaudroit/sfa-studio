@@ -9,14 +9,14 @@ import { cx } from './kit'
 type Item = string | '-'
 
 const MENUS: { label: string; items: Item[] }[] = [
-  { label: 'File', items: ['new', 'open', 'place', '-', 'save', 'saveAs', 'export', '-', 'close'] },
-  { label: 'Edit', items: ['undo', 'redo', '-', 'cut', 'copy', 'copyMerged', 'paste', 'clear', '-', 'fillFg', 'fillBg'] },
+  { label: 'File', items: ['new', 'open', 'place', '-', 'save', 'saveAs', 'savePsd', 'export', '-', 'close'] },
+  { label: 'Edit', items: ['undo', 'redo', '-', 'cut', 'copy', 'copyMerged', 'paste', 'clear', '-', 'fillFg', 'fillBg', '-', 'transform'] },
   { label: 'Image', items: ['imageSize', 'canvasSize', '-', 'rotCW', 'rotCCW', 'rot180', 'flipH', 'flipV', '-', 'cropSel', 'trim'] },
-  { label: 'Layer', items: ['newLayer', 'dupLayer', 'delLayer', '-', 'layerUp', 'layerDown', 'toggleLock', '-', 'flipLayerH', 'flipLayerV', 'rasterize', '-', 'mergeDown', 'mergeVisible', 'flatten'] },
-  { label: 'Adjust', items: ['adj:brightness', 'adj:levels', 'adj:curves', 'adj:exposure', '-', 'adj:vibrance', 'adj:hue', 'adj:bw', 'adj:invert'] },
+  { label: 'Layer', items: ['newLayer', 'dupLayer', 'delLayer', '-', 'layerUp', 'layerDown', 'toggleLock', '-', 'flipLayerH', 'flipLayerV', 'rasterize', '-', 'addMask', 'addMaskHide', 'toggleMask', 'applyMask', 'deleteMask', 'clip', '-', 'mergeDown', 'mergeVisible', 'flatten'] },
+  { label: 'Adjust', items: ['autoTone', 'autoContrast', '-', 'adj:brightness', 'adj:levels', 'adj:curves', 'adj:exposure', '-', 'adj:vibrance', 'adj:hue', 'adj:bw', 'adj:invert'] },
   { label: 'Select', items: ['selectAll', 'deselect', 'invertSel'] },
   { label: 'Filter', items: ['blur', 'sharpen', 'noise'] },
-  { label: 'View', items: ['zoomIn', 'zoomOut', 'fit', 'fill', 'actual', '-', 'rulers', 'guides', 'clearGuides'] },
+  { label: 'View', items: ['zoomIn', 'zoomOut', 'fit', 'fill', 'actual', '-', 'rulers', 'guides', 'snap', 'clearGuides', '-', 'palette'] },
   { label: 'Help', items: ['shortcuts', '-', 'github', 'issue', 'about'] },
 ]
 

@@ -1,8 +1,8 @@
-import { Copy, Eye, EyeOff, FolderDown, Layers2, Lock, LockOpen, Plus, SlidersHorizontal, Trash2, Type } from 'lucide-react'
+import { Copy, CornerDownRight, Eye, EyeOff, FolderDown, Layers2, Lock, LockOpen, Plus, SlidersHorizontal, SquareDashedMousePointer, Trash2, Type } from 'lucide-react'
 import { memo, useEffect, useRef, useState } from 'react'
 import { ADJUSTMENTS } from '../../core/adjustments'
-import { addAdjustment, addLayer, deleteLayer, duplicateLayer, mergeDown, moveLayer, selectLayer, selectLayerPixels } from '../../core/ops'
-import { layerSource } from '../../core/render'
+import { addAdjustment, addLayer, addMask, deleteLayer, duplicateLayer, mergeDown, moveLayer, selectLayer, selectLayerPixels, toggleMask } from '../../core/ops'
+import { hasFx, isClipped, layerSource } from '../../core/render'
 import { S, commit, set, updateLayer, useStore } from '../../core/store'
 import { BLEND_MODES, type BlendMode, type Layer } from '../../core/types'
 import { IconBtn, Select, Slider, cx } from '../kit'
@@ -47,8 +47,45 @@ function Thumb({ layer }: { layer: Layer }) {
   )
 }
 
-const Row = memo(function Row({ layer, active, index, onDragStart, dropHint }: {
-  layer: Layer; active: boolean; index: number
+function MaskThumb({ layer, editing }: { layer: Layer; editing: boolean }) {
+  const ref = useRef<HTMLCanvasElement>(null)
+  const ver = useStore(s => s.ver)
+  const dw = useStore(s => s.doc?.width ?? 1)
+  const dh = useStore(s => s.doc?.height ?? 1)
+  const m = layer.mask!
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const c = ref.current
+      if (!c) return
+      const g = c.getContext('2d')!
+      g.fillStyle = '#000'
+      g.fillRect(0, 0, c.width, c.height)
+      const k = Math.min(c.width / dw, c.height / dh)
+      const ox = (c.width - dw * k) / 2, oy = (c.height - dh * k) / 2
+      g.imageSmoothingQuality = 'high'
+      g.drawImage(m.bmp.canvas, ox + m.x * k, oy + m.y * k, m.bmp.canvas.width * k, m.bmp.canvas.height * k)
+    }, 60)
+    return () => clearTimeout(t)
+  }, [m, ver, dw, dh])
+  return (
+    <button
+      type="button"
+      data-tip={editing ? 'Editing mask · click the layer thumbnail to paint pixels' : 'Click to paint on the mask · Shift-click to disable'}
+      className={cx('relative h-9 w-9 shrink-0 overflow-hidden rounded-md border-2', editing ? 'border-lime' : 'border-transparent')}
+      onClick={e => {
+        if (e.shiftKey) return toggleMask(layer.id)
+        if (S().doc?.activeId !== layer.id) selectLayer(layer.id)
+        set({ editMask: true })
+      }}
+    >
+      <canvas ref={ref} width={72} height={72} className="h-full w-full rounded-[4px]" />
+      {!m.enabled && <span className="absolute inset-0 grid place-items-center bg-black/40 text-[15px] font-bold text-red-500">✕</span>}
+    </button>
+  )
+}
+
+const Row = memo(function Row({ layer, active, index, onDragStart, dropHint, clipped, editMask }: {
+  layer: Layer; active: boolean; index: number; clipped: boolean; editMask: boolean
   onDragStart: (e: React.DragEvent, index: number) => void
   dropHint: 'above' | 'below' | null
 }) {
@@ -81,7 +118,14 @@ const Row = memo(function Row({ layer, active, index, onDragStart, dropHint }: {
       >
         {layer.visible ? <Eye size={14} /> : <EyeOff size={14} />}
       </button>
-      <Thumb layer={layer} />
+      {clipped && <CornerDownRight size={13} className="-mx-1 shrink-0 text-ink-300" />}
+      <div
+        className={cx('shrink-0 rounded-[8px] border-2', layer.mask && active && !editMask ? 'border-lime' : 'border-transparent')}
+        onClick={() => { if (layer.mask) set({ editMask: false }) }}
+      >
+        <Thumb layer={layer} />
+      </div>
+      {layer.mask && <MaskThumb layer={layer} editing={active && editMask} />}
       <div className="min-w-0 flex-1">
         {editing ? (
           <input
@@ -109,6 +153,7 @@ const Row = memo(function Row({ layer, active, index, onDragStart, dropHint }: {
           {layer.opacity < 1 && ` · ${Math.round(layer.opacity * 100)}%`}
         </div>
       </div>
+      {hasFx(layer) && <span className="shrink-0 rounded bg-white/8 px-1 font-mono text-[10px] text-ink-200 italic" data-tip="Has layer effects">fx</span>}
       <button
         type="button"
         data-tip={layer.locked ? 'Unlock' : 'Lock'}
@@ -127,6 +172,7 @@ export function LayersPanel() {
   const [drag, setDrag] = useState<{ from: number; over: number | null; after: boolean } | null>(null)
   const [adjOpen, setAdjOpen] = useState(false)
   const opacityStart = useRef<number | null>(null)
+  const editMask = useStore(s => s.editMask)
 
   if (!doc) return <div className="p-4 text-ink-400">No document</div>
   const rows = [...doc.layers].map((l, i) => ({ l, i })).reverse()
@@ -197,6 +243,8 @@ export function LayersPanel() {
             layer={l}
             index={i}
             active={l.id === doc.activeId}
+            clipped={isClipped(doc.layers, i)}
+            editMask={editMask}
             onDragStart={onDragStart}
             dropHint={drag && drag.over === i && drag.from !== i ? (drag.after ? 'above' : 'below') : null}
           />
@@ -205,6 +253,7 @@ export function LayersPanel() {
       <div className="relative flex items-center gap-0.5 border-t border-white/6 px-2 py-1.5">
         <IconBtn icon={<Plus size={15} />} tip="New layer" k="Ctrl+Shift+N" side="top" onClick={addLayer} size="sm" className="h-7 w-7" />
         <IconBtn icon={<SlidersHorizontal size={15} />} tip="Adjustment layer" side="top" onClick={() => setAdjOpen(o => !o)} active={adjOpen} size="sm" className="h-7 w-7" />
+        <IconBtn icon={<SquareDashedMousePointer size={15} />} tip="Add mask (from selection if any)" side="top" onClick={() => addMask()} size="sm" className="h-7 w-7" />
         <IconBtn icon={<Copy size={14} />} tip="Duplicate" k="Ctrl+J" side="top" onClick={duplicateLayer} size="sm" className="h-7 w-7" />
         <IconBtn icon={<FolderDown size={15} />} tip="Merge down" k="Ctrl+E" side="top" onClick={mergeDown} size="sm" className="h-7 w-7" />
         <div className="flex-1" />

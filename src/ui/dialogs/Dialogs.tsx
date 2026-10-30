@@ -274,7 +274,7 @@ const SHEET: { title: string; rows: [string, string][] }[] = [
   },
   { title: 'File', rows: ['new', 'open', 'save', 'saveAs', 'export', 'place'].map(id => [COMMANDS[id].label.replace('…', ''), COMMANDS[id].keys!]) },
   { title: 'Edit', rows: ['undo', 'redo', 'copy', 'paste', 'clear', 'fillFg', 'selectAll', 'deselect', 'invertSel'].map(id => [COMMANDS[id].label.replace('…', ''), COMMANDS[id].keys!]) },
-  { title: 'Layers', rows: [['New layer', 'Ctrl+Shift+N'], ['Duplicate / copy selection', 'Ctrl+J'], ['Merge down', 'Ctrl+E'], ['Move up / down', 'Ctrl+]  Ctrl+['], ['Levels / Curves', 'Ctrl+L  Ctrl+M'], ['Hue / Saturation', 'Ctrl+U'], ['Select layer pixels', 'Ctrl+click thumb']] },
+  { title: 'Layers', rows: [['New layer', 'Ctrl+Shift+N'], ['Duplicate / copy selection', 'Ctrl+J'], ['Merge down', 'Ctrl+E'], ['Move up / down', 'Ctrl+]  Ctrl+['], ['Levels / Curves', 'Ctrl+L  Ctrl+M'], ['Hue / Saturation', 'Ctrl+U'], ['Select layer pixels', 'Ctrl+click thumb'], ['Clipping mask', 'Ctrl+Alt+G'], ['Auto tone', 'Ctrl+Shift+L'], ['Search commands', 'Ctrl+F']] },
 ]
 
 function ShortcutsDialog({ onClose }: { onClose: () => void }) {

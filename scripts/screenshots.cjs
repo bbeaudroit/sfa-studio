@@ -9,6 +9,7 @@ const shots = [
   ['demo', 'studio-main.png'],
   ['demo-curves', 'studio-curves.png'],
   ['demo-sel', 'studio-selection.png'],
+  ['demo-fx', 'studio-effects.png'],
 ]
 
 app.on('window-all-closed', () => {})

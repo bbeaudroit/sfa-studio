@@ -119,7 +119,7 @@ export function Slider({ label, value, min, max, step = 1, onChange, onCommit, u
         onKeyUp={onCommit}
       />
       <input
-        className="num w-14 shrink-0 px-1.5 text-right"
+        className="num w-[62px] shrink-0 px-1.5 text-right"
         value={draft ?? (format ? format(value) : `${+value.toFixed(2)}${unit}`)}
         onFocus={e => { setDraft(String(+value.toFixed(2))); setTimeout(() => e.target.select()) }}
         onChange={e => setDraft(e.target.value)}

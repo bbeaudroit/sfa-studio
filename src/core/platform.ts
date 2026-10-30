@@ -36,8 +36,9 @@ export const bridge = typeof window !== 'undefined' ? window.sfa : undefined
 export const isDesktop = !!bridge
 
 export const IMAGE_FILTERS: FileFilter[] = [
-  { name: 'Images & projects', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif', 'sfas'] },
+  { name: 'Images & projects', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif', 'psd', 'sfas'] },
   { name: 'SFA Studio project', extensions: ['sfas'] },
+  { name: 'Photoshop document', extensions: ['psd'] },
 ]
 
 export async function pickFile(filters = IMAGE_FILTERS): Promise<OpenedFile | null> {

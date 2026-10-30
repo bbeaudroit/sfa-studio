@@ -1,13 +1,14 @@
 import { ADJUSTMENTS } from './core/adjustments'
-import { confirmDiscard, openDialog, paste, placeDialog, saveProject } from './core/files'
+import { confirmDiscard, openDialog, paste, placeDialog, savePsd, saveProject } from './core/files'
 import {
-  addAdjustment, addLayer, clearSelected, copy, cropToSelection, deleteLayer, deselect, duplicateLayer,
+  autoAdjust, addAdjustment, addLayer, addMask, applyMask, deleteMask, toggleClip, toggleMask, clearSelected, copy, cropToSelection, deleteLayer, deselect, duplicateLayer,
   fillSelection, flatten, flipCanvas, flipLayer, invertSelection, mergeDown, mergeVisible, rasterize,
   rotateCanvas, selectAll, stepLayer, trimTransparent,
 } from './core/ops'
-import { S, activeLayer, closeDoc, redo, set, undo, updateDoc, type ToolId } from './core/store'
+import { S, activeLayer, closeDoc, redo, set, setOpt, undo, updateDoc, type ToolId } from './core/store'
 import { actualPixels, fillView, fitView, zoomStep } from './core/view'
 import { bridge } from './core/platform'
+import { beginTransform } from './tools/tools'
 import type { AdjustmentType } from './core/types'
 
 export interface Command {
@@ -34,6 +35,7 @@ const list: Command[] = [
   { id: 'place', label: 'Place image as layer…', keys: 'Ctrl+Shift+P', run: placeDialog, enabled: hasDoc },
   { id: 'save', label: 'Save project', keys: 'Ctrl+S', run: () => saveProject(), enabled: hasDoc },
   { id: 'saveAs', label: 'Save project as…', keys: 'Ctrl+Shift+S', run: () => saveProject(true), enabled: hasDoc },
+  { id: 'savePsd', label: 'Save as PSD…', run: savePsd, enabled: hasDoc },
   { id: 'export', label: 'Export image…', keys: 'Ctrl+Shift+E', run: () => set({ dialog: 'export' }), enabled: hasDoc },
   { id: 'close', label: 'Close', keys: 'Ctrl+W', run: async () => { if (await confirmDiscard()) closeDoc() }, enabled: hasDoc },
   // Edit
@@ -47,6 +49,7 @@ const list: Command[] = [
   { id: 'clear', label: 'Delete', keys: 'Delete', run: clearSelected, enabled: hasDoc },
   { id: 'fillFg', label: 'Fill with foreground', keys: 'Alt+Backspace', run: () => fillSelection(S().fg), enabled: hasDoc },
   { id: 'fillBg', label: 'Fill with background', keys: 'Ctrl+Backspace', run: () => fillSelection(S().bg), enabled: hasDoc },
+  { id: 'transform', label: 'Free transform', keys: 'Ctrl+T', run: beginTransform, enabled: isKind('raster', 'text', 'shape') },
   // Image
   { id: 'imageSize', label: 'Image size…', keys: 'Ctrl+Alt+I', run: () => set({ dialog: 'imageSize' }), enabled: hasDoc },
   { id: 'canvasSize', label: 'Canvas size…', keys: 'Ctrl+Alt+C', run: () => set({ dialog: 'canvasSize' }), enabled: hasDoc },
@@ -64,6 +67,12 @@ const list: Command[] = [
   { id: 'mergeDown', label: 'Merge down', keys: 'Ctrl+E', run: mergeDown, enabled: hasDoc },
   { id: 'mergeVisible', label: 'Merge visible', keys: 'Ctrl+Shift+Alt+E', run: mergeVisible, enabled: hasDoc },
   { id: 'flatten', label: 'Flatten image', run: flatten, enabled: hasDoc },
+  { id: 'addMask', label: 'Add mask', run: () => addMask(), enabled: () => !!activeLayer() && !activeLayer()!.mask },
+  { id: 'addMaskHide', label: 'Add mask (hide all)', run: () => addMask('hide'), enabled: () => !!activeLayer() && !activeLayer()!.mask },
+  { id: 'toggleMask', label: 'Disable mask', run: () => toggleMask(), enabled: () => !!activeLayer()?.mask, checked: () => activeLayer()?.mask?.enabled === false },
+  { id: 'applyMask', label: 'Apply mask', run: applyMask, enabled: () => !!activeLayer()?.mask && activeLayer()!.kind !== 'adjust' },
+  { id: 'deleteMask', label: 'Delete mask', run: () => deleteMask(), enabled: () => !!activeLayer()?.mask },
+  { id: 'clip', label: 'Clipping mask', keys: 'Ctrl+Alt+G', run: () => toggleClip(), enabled: hasDoc, checked: () => !!activeLayer()?.clip },
   { id: 'rasterize', label: 'Rasterize layer', run: () => rasterize(), enabled: isKind('text', 'shape') },
   { id: 'layerUp', label: 'Bring forward', keys: 'Ctrl+]', run: () => stepLayer(1), enabled: hasDoc },
   { id: 'layerDown', label: 'Send backward', keys: 'Ctrl+[', run: () => stepLayer(-1), enabled: hasDoc },
@@ -72,6 +81,8 @@ const list: Command[] = [
   { id: 'toggleLock', label: 'Lock layer', keys: 'Ctrl+/', run: () => { const l = activeLayer(); if (l) updateDoc(d => ({ ...d, layers: d.layers.map(x => x.id === l.id ? { ...x, locked: !x.locked } : x) }), l.locked ? 'Unlock layer' : 'Lock layer') }, enabled: hasDoc, checked: () => !!activeLayer()?.locked },
   // Adjustments
   ...ADJUSTMENTS.map(a => ({ id: `adj:${a.type}`, label: a.label, keys: adjKeys[a.type], run: () => addAdjustment(a.type), enabled: hasDoc })),
+  { id: 'autoTone', label: 'Auto tone', keys: 'Ctrl+Shift+L', run: () => autoAdjust('tone'), enabled: hasDoc },
+  { id: 'autoContrast', label: 'Auto contrast', keys: 'Ctrl+Alt+Shift+L', run: () => autoAdjust('contrast'), enabled: hasDoc },
   // Select
   { id: 'selectAll', label: 'All', keys: 'Ctrl+A', run: selectAll, enabled: hasDoc },
   { id: 'deselect', label: 'Deselect', keys: 'Ctrl+D', run: deselect, enabled: hasSel },
@@ -88,6 +99,8 @@ const list: Command[] = [
   { id: 'actual', label: 'Actual pixels', keys: 'Ctrl+1', run: actualPixels, enabled: hasDoc },
   { id: 'rulers', label: 'Rulers', keys: 'Ctrl+R', run: () => set(s => ({ rulers: !s.rulers })), checked: () => S().rulers },
   { id: 'guides', label: 'Guides', keys: 'Ctrl+;', run: () => set(s => ({ showGuides: !s.showGuides })), checked: () => S().showGuides },
+  { id: 'snap', label: 'Snap', keys: 'Ctrl+Shift+;', run: () => setOpt('move', { snap: !S().opts.move.snap }), checked: () => S().opts.move.snap },
+  { id: 'palette', label: 'Search commands', keys: 'Ctrl+F', run: () => set(s => ({ palette: !s.palette })) },
   { id: 'clearGuides', label: 'Clear guides', run: () => updateDoc(d => ({ ...d, guides: { h: [], v: [] } }), 'Clear guides'), enabled: () => !!S().doc && (S().doc!.guides.h.length + S().doc!.guides.v.length > 0) },
   // Help
   { id: 'shortcuts', label: 'Keyboard shortcuts', keys: 'Ctrl+/', run: () => set({ dialog: 'shortcuts' }) },
@@ -128,12 +141,16 @@ export const TOOL_DEFS: ToolDef[] = [
   { id: 'eyedropper', label: 'Eyedropper', key: 'I' },
   { id: 'brush', label: 'Brush', key: 'B' },
   { id: 'eraser', label: 'Eraser', key: 'E' },
+  { id: 'clone', label: 'Clone stamp', key: 'S' },
+  { id: 'dodge', label: 'Dodge / burn / sponge', key: 'O' },
+  { id: 'focus', label: 'Blur / sharpen', key: 'R' },
   { id: 'bucket', label: 'Fill', key: 'G' },
   { id: 'gradient', label: 'Gradient', key: 'G' },
   { id: 'text', label: 'Text', key: 'T' },
   { id: 'shape', label: 'Shape', key: 'U' },
   { id: 'hand', label: 'Hand', key: 'H' },
   { id: 'zoom', label: 'Zoom', key: 'Z' },
+  { id: 'transform', label: 'Free transform', key: 'Ctrl+T' },
 ]
 
 export function keyString(e: KeyboardEvent) {

@@ -20,11 +20,18 @@ export async function encodeProject(doc: Doc): Promise<Uint8Array> {
   const files: Record<string, Uint8Array> = {}
   const layers = await Promise.all(
     doc.layers.map(async l => {
-      if (l.kind !== 'raster') return l
+      let out: Record<string, unknown> = { ...l }
+      if (l.mask) {
+        const mfile = `masks/${l.id}.png`
+        files[mfile] = await pngBytes(l.mask.bmp.canvas)
+        out.mask = { file: mfile, x: l.mask.x, y: l.mask.y, enabled: l.mask.enabled }
+      }
+      if (l.kind !== 'raster') return out
       const file = `layers/${l.id}.png`
       files[file] = await pngBytes(l.bmp.canvas)
-      const { bmp: _bmp, ...rest } = l
-      return { ...rest, file }
+      const { bmp: _bmp, ...rest } = out as typeof out & { bmp: unknown }
+      out = { ...rest, file }
+      return out
     }),
   )
   const flat = flattenToCanvas(doc)
@@ -44,14 +51,18 @@ export async function decodeProject(data: Uint8Array): Promise<Doc> {
   const meta = JSON.parse(strFromU8(json))
   if (meta.format !== FORMAT) throw new Error('Not an SFA Studio project')
   const layers: Layer[] = await Promise.all(
-    meta.layers.map(async (l: Layer & { file?: string }) => {
-      if (l.kind !== 'raster') return l
-      const bytes = files[l.file!]
-      const img = await loadImage(new Blob([bytes as BlobPart], { type: 'image/png' }))
-      const c = makeCanvas(img.width, img.height)
-      ctx2d(c).drawImage(img, 0, 0)
-      const { file: _f, ...rest } = l
-      return { ...rest, bmp: { id: uid('bmp'), canvas: c } } as Layer
+    meta.layers.map(async (l0: Layer & { file?: string; mask?: { file: string; x: number; y: number; enabled: boolean } | null }) => {
+      const png = async (name: string) => {
+        const img = await loadImage(new Blob([files[name] as BlobPart], { type: 'image/png' }))
+        const c = makeCanvas(img.width, img.height)
+        ctx2d(c).drawImage(img, 0, 0)
+        return { id: uid('bmp'), canvas: c }
+      }
+      const { mask, ...l } = l0
+      const restored = mask && files[mask.file] ? { bmp: await png(mask.file), x: mask.x, y: mask.y, enabled: mask.enabled } : null
+      if (l.kind !== 'raster') return { ...l, mask: restored } as Layer
+      const { file, ...rest } = l
+      return { ...rest, mask: restored, bmp: await png(file!) } as Layer
     }),
   )
   return {
@@ -73,7 +84,14 @@ export async function confirmDiscard(): Promise<boolean> {
 
 export async function openBytes(name: string, path: string | null, data: Uint8Array, asLayer = false) {
   try {
-    if (/\.sfas$/i.test(name)) {
+    if (/\.psd$/i.test(name)) {
+      if (!(await confirmDiscard())) return
+      const { importPsd } = await import('./psd')
+      const r = importPsd(data)
+      loadDoc(r.doc, name, null)
+      fitView()
+      if (r.notes.length) toast(`Opened. Note: ${r.notes.join('; ')}.`, undefined, 6000)
+    } else if (/\.sfas$/i.test(name)) {
       if (!(await confirmDiscard())) return
       const doc = await decodeProject(data)
       loadDoc(doc, name, path)
@@ -116,7 +134,7 @@ export async function openPath(path: string) {
 
 export async function openFiles(files: File[], asLayer: boolean) {
   for (const f of files) {
-    if (!/^image\//.test(f.type) && !/\.sfas$/i.test(f.name)) continue
+    if (!/^image\//.test(f.type) && !/\.(sfas|psd)$/i.test(f.name)) continue
     const path = bridge?.pathForFile(f) ?? null
     await openBytes(f.name, path, new Uint8Array(await f.arrayBuffer()), asLayer && !!S().doc)
     asLayer = true
@@ -171,6 +189,14 @@ export async function saveProject(forceDialog = false) {
   if (path) pushRecent(path)
   markSaved()
   toast('Saved')
+}
+
+export async function savePsd() {
+  const s = S()
+  if (!s.doc) return
+  const { exportPsd } = await import('./psd')
+  const r = await saveAs(`${stripExt(s.docName)}.psd`, [{ name: 'Photoshop document', extensions: ['psd'] }], exportPsd(s.doc))
+  if (r) toast(`Saved ${baseName(r)}`)
 }
 
 export type ExportFormat = 'png' | 'jpeg' | 'webp'

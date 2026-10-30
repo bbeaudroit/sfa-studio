@@ -6,6 +6,7 @@ import { bridge } from './core/platform'
 import { S, set, setOpt, useStore, type ToolId } from './core/store'
 import { TOOLS, isToolBusy } from './tools/tools'
 import { Dialogs } from './ui/dialogs/Dialogs'
+import { CommandPalette } from './ui/Palette'
 import { MenuBar } from './ui/MenuBar'
 import { OptionsBar } from './ui/OptionsBar'
 import { HistoryPanel } from './ui/panels/History'
@@ -68,13 +69,13 @@ function Dock() {
 
 const TOOL_KEYS: Record<string, ToolId[]> = {
   V: ['move'], M: ['marquee'], L: ['lasso'], W: ['wand'], C: ['crop'], I: ['eyedropper'], B: ['brush'],
-  E: ['eraser'], G: ['bucket', 'gradient'], T: ['text'], U: ['shape'], H: ['hand'], Z: ['zoom'],
+  E: ['eraser'], S: ['clone'], O: ['dodge'], R: ['focus'], G: ['bucket', 'gradient'], T: ['text'], U: ['shape'], H: ['hand'], Z: ['zoom'],
 }
 
 function useKeyboard() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (isTyping(e) || S().dialog) return
+      if (isTyping(e) || S().dialog || S().palette) return
       const tool = TOOLS[S().tool]
       if (tool.key?.(e)) { e.preventDefault(); return }
       const id = commandForKey(e)
@@ -93,6 +94,11 @@ function useKeyboard() {
         const list = TOOL_KEYS[k]
         const cur = S().tool
         if (e.shiftKey && k === 'M' && cur === 'marquee') return setOpt('marquee', { shape: S().opts.marquee.shape === 'rect' ? 'ellipse' : 'rect' })
+        if (e.shiftKey && k === 'O' && cur === 'dodge') {
+          const order = ['dodge', 'burn', 'sponge', 'saturate'] as const
+          return setOpt('dodge', { mode: order[(order.indexOf(S().opts.dodge.mode) + 1) % 4] })
+        }
+        if (e.shiftKey && k === 'R' && cur === 'focus') return setOpt('focus', { mode: S().opts.focus.mode === 'blur' ? 'sharpen' : 'blur' })
         if (e.shiftKey && k === 'U' && cur === 'shape') {
           const order = ['rect', 'ellipse', 'line'] as const
           return setOpt('shape', { shape: order[(order.indexOf(S().opts.shape.shape) + 1) % 3] })
@@ -104,7 +110,7 @@ function useKeyboard() {
       if (e.key === 'x' || e.key === 'X') return set(s => ({ fg: s.bg, bg: s.fg }))
       if (e.key === 'd' || e.key === 'D') return set({ fg: '#000000', bg: '#ffffff' })
       const t = S().tool
-      if ((t === 'brush' || t === 'eraser') && (e.code === 'BracketLeft' || e.code === 'BracketRight')) {
+      if ((t === 'brush' || t === 'eraser' || t === 'clone' || t === 'dodge' || t === 'focus') && (e.code === 'BracketLeft' || e.code === 'BracketRight')) {
         const o = S().opts[t]
         const up = e.code === 'BracketRight'
         if (e.shiftKey) setOpt(t, { hardness: Math.min(1, Math.max(0, o.hardness + (up ? 0.1 : -0.1))) })
@@ -114,7 +120,7 @@ function useKeyboard() {
         }
         return
       }
-      if ((t === 'brush' || t === 'eraser') && /^Digit\d$/.test(e.code)) {
+      if ((t === 'brush' || t === 'eraser' || t === 'clone') && /^Digit\d$/.test(e.code)) {
         const n = Number(e.code.slice(5))
         setOpt(t, { opacity: n === 0 ? 1 : n / 10 })
       }
@@ -179,6 +185,7 @@ export default function App() {
       </div>
       <StatusBar />
       <Dialogs />
+      <CommandPalette />
       <Toasts />
       <Onboarding />
       <DropOverlay />

@@ -1,6 +1,6 @@
 import {
   Brush, Circle, CircleDashed, Crop, Eraser, Hand, Lasso, Minus, MousePointer2, PaintBucket, Pipette,
-  Square, SquareDashed, Type, WandSparkles, ZoomIn,
+  Droplet, Eclipse, Scaling, Square, SquareDashed, Stamp, Type, WandSparkles, ZoomIn,
 } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { TOOL_DEFS } from '../commands'
@@ -36,6 +36,10 @@ export function ToolIcon({ id, size = 17 }: { id: ToolId; size?: number }) {
     eyedropper: <Pipette {...p} />,
     brush: <Brush {...p} />,
     eraser: <Eraser {...p} />,
+    clone: <Stamp {...p} />,
+    dodge: <Eclipse {...p} />,
+    focus: <Droplet {...p} />,
+    transform: <Scaling {...p} />,
     bucket: <PaintBucket {...p} />,
     gradient: <GradientIcon size={size} />,
     text: <Type {...p} />,
@@ -50,6 +54,7 @@ const GROUPS: ToolId[][] = [
   ['move', 'marquee', 'lasso', 'wand'],
   ['crop', 'eyedropper'],
   ['brush', 'eraser', 'bucket', 'gradient'],
+  ['clone', 'dodge', 'focus'],
   ['text', 'shape'],
   ['hand', 'zoom'],
 ]

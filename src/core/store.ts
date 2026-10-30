@@ -5,7 +5,7 @@ import type { Bitmap, Doc, Layer, Rect } from './types'
 
 export type ToolId =
   | 'move' | 'marquee' | 'lasso' | 'wand' | 'crop' | 'eyedropper'
-  | 'brush' | 'eraser' | 'bucket' | 'gradient' | 'text' | 'shape' | 'hand' | 'zoom'
+  | 'brush' | 'eraser' | 'clone' | 'dodge' | 'focus' | 'bucket' | 'gradient' | 'text' | 'shape' | 'hand' | 'zoom' | 'transform'
 
 export interface Patch {
   bmp: Bitmap
@@ -24,6 +24,9 @@ export interface HistoryEntry {
 export interface ToolOptions {
   brush: { size: number; hardness: number; opacity: number }
   eraser: { size: number; hardness: number; opacity: number }
+  clone: { size: number; hardness: number; opacity: number; aligned: boolean; sampleAll: boolean }
+  dodge: { size: number; hardness: number; mode: 'dodge' | 'burn' | 'sponge' | 'saturate'; range: 'shadows' | 'midtones' | 'highlights'; strength: number }
+  focus: { size: number; hardness: number; mode: 'blur' | 'sharpen'; strength: number }
   marquee: { shape: 'rect' | 'ellipse'; feather: number; mode: 'new' | 'add' | 'subtract' | 'intersect' }
   lasso: { poly: boolean; feather: number; mode: 'new' | 'add' | 'subtract' | 'intersect' }
   wand: { tolerance: number; contiguous: boolean; sampleAll: boolean; mode: 'new' | 'add' | 'subtract' | 'intersect' }
@@ -32,7 +35,7 @@ export interface ToolOptions {
   crop: { aspect: string; deleteCropped: boolean }
   text: { font: string; size: number; weight: number; align: 'left' | 'center' | 'right' }
   shape: { shape: 'rect' | 'ellipse' | 'line'; fill: boolean; stroke: boolean; strokeWidth: number; radius: number }
-  move: { autoSelect: boolean }
+  move: { autoSelect: boolean; snap: boolean }
 }
 
 export type DialogId =
@@ -75,6 +78,9 @@ interface State {
   showGuides: boolean
   dialog: DialogId
   textEditId: string | null
+  /** Paint tools target the active layer's mask. */
+  editMask: boolean
+  palette: boolean
   toasts: Toast[]
   recentColors: string[]
 }
@@ -82,6 +88,9 @@ interface State {
 const DEFAULT_OPTS: ToolOptions = {
   brush: { size: 24, hardness: 0.85, opacity: 1 },
   eraser: { size: 40, hardness: 0.9, opacity: 1 },
+  clone: { size: 40, hardness: 0.7, opacity: 1, aligned: true, sampleAll: false },
+  dodge: { size: 60, hardness: 0.3, mode: 'dodge', range: 'midtones', strength: 30 },
+  focus: { size: 50, hardness: 0.4, mode: 'blur', strength: 50 },
   marquee: { shape: 'rect', feather: 0, mode: 'new' },
   lasso: { poly: false, feather: 0, mode: 'new' },
   wand: { tolerance: 32, contiguous: true, sampleAll: true, mode: 'new' },
@@ -90,7 +99,7 @@ const DEFAULT_OPTS: ToolOptions = {
   crop: { aspect: 'free', deleteCropped: true },
   text: { font: 'Geist Variable', size: 72, weight: 600, align: 'left' },
   shape: { shape: 'rect', fill: true, stroke: false, strokeWidth: 6, radius: 0 },
-  move: { autoSelect: true },
+  move: { autoSelect: true, snap: true },
 }
 
 function loadOpts(): ToolOptions {
@@ -127,6 +136,8 @@ export const useStore = create<State>(() => ({
   showGuides: true,
   dialog: null,
   textEditId: null,
+  editMask: false,
+  palette: false,
   toasts: [],
   recentColors: [],
 }))
@@ -136,6 +147,7 @@ export const set = useStore.setState
 
 let saveTimer = 0
 useStore.subscribe((s, p) => {
+  if (s.editMask && s.doc?.activeId !== p.doc?.activeId) set({ editMask: false })
   if (s.opts !== p.opts) {
     clearTimeout(saveTimer)
     saveTimer = window.setTimeout(() => {

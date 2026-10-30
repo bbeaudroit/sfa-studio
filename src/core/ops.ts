@@ -1,12 +1,12 @@
 import { defaultAdjustment, adjustmentLabel } from './adjustments'
-import { alphaBounds, bitmapFrom, ctx2d, makeCanvas, newBitmap, uid } from './bitmap'
-import { compositeLayers, flattenToCanvas, layerSource, textLayout } from './render'
+import { alphaBounds, bitmapFrom, cloneBitmap, ctx2d, makeCanvas, newBitmap, uid } from './bitmap'
+import { compositeLayers, flattenToCanvas, layerSource, maskToAlpha, textLayout } from './render'
 import { combineMasks, invertMask, maskBounds, rectMask, type SelMode } from './selection'
 import {
   S, activeLayer, commit, editPixels, loadDoc, set, toast, updateDoc,
   type Patch,
 } from './store'
-import type { AdjustLayer, AdjustmentType, Bitmap, Doc, Layer, RasterLayer, Rect, ShapeLayer, TextLayer } from './types'
+import type { Adjustment, AdjustLayer, AdjustmentType, Bitmap, Doc, Layer, RasterLayer, Rect, ShapeLayer, TextLayer } from './types'
 import { fitView } from './view'
 
 const base = (name: string) => ({ id: uid('layer'), name, visible: true, locked: false, opacity: 1, blend: 'source-over' as const })
@@ -76,6 +76,47 @@ export function addAdjustment(type: AdjustmentType) {
   insertAbove(l, adjustmentLabel(type))
 }
 
+/** Auto contrast (luminance levels) or auto tone (per-channel curves), as an editable adjustment layer. */
+export function autoAdjust(kind: 'contrast' | 'tone') {
+  const d = S().doc
+  if (!d) return
+  const i = d.layers.findIndex(l => l.id === d.activeId)
+  const flat = flattenToCanvas(d, d.layers.slice(0, i + 1))
+  const k = Math.min(1, 600 / Math.max(d.width, d.height))
+  const sm = makeCanvas(d.width * k, d.height * k)
+  ctx2d(sm).drawImage(flat, 0, 0, sm.width, sm.height)
+  const px = ctx2d(sm, true).getImageData(0, 0, sm.width, sm.height).data
+  const hist = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)]
+  let n = 0
+  for (let j = 0; j < px.length; j += 4) {
+    if (px[j + 3] < 8) continue
+    n++
+    hist[0][px[j]]++
+    hist[1][px[j + 1]]++
+    hist[2][px[j + 2]]++
+    hist[3][(px[j] * 77 + px[j + 1] * 150 + px[j + 2] * 29) >> 8]++
+  }
+  if (!n) return toast('Nothing to analyze')
+  const clip = n * 0.001
+  const range = (h: Uint32Array): [number, number] => {
+    let lo = 0, hi = 255, acc = 0
+    while (lo < 254 && (acc += h[lo]) <= clip) lo++
+    acc = 0
+    while (hi > lo + 1 && (acc += h[hi]) <= clip) hi--
+    return [lo, hi]
+  }
+  let adj: Adjustment
+  if (kind === 'contrast') {
+    const [lo, hi] = range(hist[3])
+    adj = { type: 'levels', inBlack: lo, inWhite: hi, gamma: 1, outBlack: 0, outWhite: 255 }
+  } else {
+    const ch = (h: Uint32Array): [number, number][] => { const [lo, hi] = range(h); return [[lo, 0], [hi, 255]] }
+    adj = { type: 'curves', rgb: [[0, 0], [255, 255]], r: ch(hist[0]), g: ch(hist[1]), b: ch(hist[2]) }
+  }
+  const name = kind === 'contrast' ? 'Auto contrast' : 'Auto tone'
+  insertAbove({ ...base(name), kind: 'adjust', adj }, name)
+}
+
 export function addText(x: number, y: number, text = 'Text'): TextLayer {
   const o = S().opts.text
   const l: TextLayer = {
@@ -127,8 +168,9 @@ export function deleteLayer(id = S().doc?.activeId) {
 
 function cloneLayer(l: Layer, name?: string): Layer {
   const id = uid('layer')
-  if (l.kind === 'raster') return { ...l, id, name: name ?? `${l.name} copy`, bmp: bitmapFrom(l.bmp.canvas, l.bmp.canvas.width, l.bmp.canvas.height) }
-  return { ...l, id, name: name ?? `${l.name} copy` } as Layer
+  const mask = l.mask ? { ...l.mask, bmp: cloneBitmap(l.mask.bmp) } : l.mask
+  if (l.kind === 'raster') return { ...l, id, mask, name: name ?? `${l.name} copy`, bmp: bitmapFrom(l.bmp.canvas, l.bmp.canvas.width, l.bmp.canvas.height) }
+  return { ...l, id, mask, name: name ?? `${l.name} copy` } as Layer
 }
 
 /** Ctrl+J: duplicates the layer, or copies the selected pixels into a new layer. */
@@ -174,8 +216,8 @@ export function rasterOf(l: Layer, d: Doc): RasterLayer {
   const bmp = newBitmap(d.width, d.height)
   const s = layerSource(l)
   if (s) ctx2d(bmp.canvas).drawImage(s.src, s.x, s.y)
-  const { id, name, visible, locked, opacity, blend } = l
-  return { id, name, visible, locked, opacity, blend, kind: 'raster', bmp, x: 0, y: 0 }
+  const { id, name, visible, locked, opacity, blend, mask, clip, fx } = l
+  return { id, name, visible, locked, opacity, blend, mask, clip, fx, kind: 'raster', bmp, x: 0, y: 0 }
 }
 
 export function rasterize(id = S().doc?.activeId) {
@@ -192,7 +234,8 @@ export function mergeDown() {
   const c = makeCanvas(d.width, d.height)
   // Bottom at full strength, top with its own opacity/blend; result keeps the lower layer's settings.
   compositeLayers(ctx2d(c), [{ ...low, opacity: 1, blend: 'source-over', visible: true }, top], d.width, d.height)
-  const merged: RasterLayer = { ...rasterOf(low, d), bmp: { id: uid('bmp'), canvas: c }, x: 0, y: 0 }
+  // Mask and effects of the lower layer are baked into the merged pixels.
+  const merged: RasterLayer = { ...rasterOf(low, d), bmp: { id: uid('bmp'), canvas: c }, x: 0, y: 0, mask: null, fx: undefined }
   updateDoc(d => {
     const layers = [...d.layers]
     layers.splice(i - 1, 2, merged)
@@ -286,8 +329,39 @@ function coverDoc(l: RasterLayer): RasterLayer {
   return nl
 }
 
-/** Selection mask in layer-local space, or null when nothing is selected. */
-export function selectionRectFor(l: RasterLayer): Rect | null {
+/** Where pixel tools draw: the active layer's pixels, or its mask while the mask is being edited. */
+export interface PaintTarget {
+  layer: Layer
+  bmp: Bitmap
+  x: number
+  y: number
+  isMask: boolean
+}
+
+export function paintTarget(): PaintTarget | null {
+  const l = activeLayer()
+  if (!l) return null
+  if (S().editMask && l.mask) {
+    if (l.locked) {
+      toast('Layer is locked')
+      return null
+    }
+    return { layer: l, bmp: l.mask.bmp, x: l.mask.x, y: l.mask.y, isMask: true }
+  }
+  const r = editableRaster()
+  return r ? { layer: r, bmp: r.bmp, x: r.x, y: r.y, isMask: false } : null
+}
+
+/** Masks are grayscale: map a paint color to its luminance. */
+export function grayOf(hex: string): string {
+  const n = parseInt(hex.replace('#', '').slice(0, 6), 16) || 0
+  const v = Math.round(((n >> 16) & 255) * 0.299 + ((n >> 8) & 255) * 0.587 + (n & 255) * 0.114)
+  const h = v.toString(16).padStart(2, '0')
+  return `#${h}${h}${h}`
+}
+
+/** Selection bounds in target-local space, or null when nothing is selected. */
+export function selectionRectFor(l: { x: number; y: number }): Rect | null {
   const sel = S().doc?.selection
   if (!sel) return null
   const b = maskBounds(sel)
@@ -299,7 +373,7 @@ export function selectionRectFor(l: RasterLayer): Rect | null {
  * `fn` draws the processed result for the given source canvas.
  */
 export function filterActive(label: string, fn: (src: HTMLCanvasElement) => HTMLCanvasElement) {
-  const l = editableRaster()
+  const l = paintTarget()
   if (!l) return
   const sel = S().doc!.selection
   const result = fn(l.bmp.canvas)
@@ -327,8 +401,9 @@ export function clearSelected() {
   const d = S().doc
   if (!d) return
   if (!d.selection) return deleteLayer()
-  const l = editableRaster()
+  const l = paintTarget()
   if (!l) return
+  if (l.isMask) return fillSelection('#000000')
   const patch = editPixels(l.bmp, selectionRectFor(l), g => {
     g.globalCompositeOperation = 'destination-out'
     g.drawImage(d.selection!.canvas, -l.x, -l.y)
@@ -338,8 +413,9 @@ export function clearSelected() {
 }
 
 export function fillSelection(color: string) {
-  const l = editableRaster()
+  const l = paintTarget()
   if (!l) return
+  if (l.isMask) color = grayOf(color)
   const d = S().doc!
   const patch = editPixels(l.bmp, selectionRectFor(l), g => {
     if (!d.selection) {
@@ -356,6 +432,78 @@ export function fillSelection(color: string) {
     g.drawImage(c, -l.x, -l.y)
   })
   commit('Fill', patch ? [patch] : [])
+}
+
+// --- Masks & clipping ---------------------------------------------------------
+
+export function addMask(mode: 'reveal' | 'hide' | 'selection' = S().doc?.selection ? 'selection' : 'reveal') {
+  const d = S().doc
+  const l = activeLayer()
+  if (!d || !l) return
+  if (l.mask) return set({ editMask: true })
+  const bmp = newBitmap(d.width, d.height, mode === 'reveal' ? '#ffffff' : '#000000')
+  if (mode === 'selection' && d.selection) ctx2d(bmp.canvas).drawImage(d.selection.canvas, 0, 0)
+  updateDoc(d => ({ ...d, layers: d.layers.map(x => (x.id === l.id ? ({ ...x, mask: { bmp, x: 0, y: 0, enabled: true } } as Layer) : x)) }), 'Add mask')
+  set({ editMask: true })
+}
+
+export function deleteMask(id = S().doc?.activeId) {
+  updateDoc(d => ({ ...d, layers: d.layers.map(x => (x.id === id ? ({ ...x, mask: null } as Layer) : x)) }), 'Delete mask')
+  set({ editMask: false })
+}
+
+export function toggleMask(id = S().doc?.activeId) {
+  const l = S().doc?.layers.find(x => x.id === id)
+  if (!l?.mask) return
+  updateDoc(d => ({ ...d, layers: d.layers.map(x => (x.id === id ? ({ ...x, mask: { ...x.mask!, enabled: !x.mask!.enabled } } as Layer) : x)) }), l.mask.enabled ? 'Disable mask' : 'Enable mask')
+}
+
+/** Bakes the mask into the layer's pixels. */
+export function applyMask() {
+  const d = S().doc
+  const l = activeLayer()
+  if (!d || !l?.mask) return
+  if (l.kind === 'adjust') return toast('Adjustment layers keep their mask')
+  const r = rasterOf(l, d)
+  const c = makeCanvas(r.bmp.canvas.width, r.bmp.canvas.height)
+  const g = ctx2d(c)
+  g.drawImage(r.bmp.canvas, 0, 0)
+  g.globalCompositeOperation = 'destination-in'
+  g.drawImage(maskToAlpha(l.mask.bmp.canvas, false), l.mask.x - r.x, l.mask.y - r.y)
+  const nl: RasterLayer = { ...r, bmp: { id: uid('bmp'), canvas: c }, mask: null }
+  updateDoc(d => ({ ...d, layers: d.layers.map(x => (x.id === l.id ? nl : x)) }), 'Apply mask')
+  set({ editMask: false })
+}
+
+export function toggleClip(id = S().doc?.activeId) {
+  const d = S().doc
+  const i = d?.layers.findIndex(x => x.id === id) ?? -1
+  if (!d || i < 0) return
+  const l = d.layers[i]
+  if (!l.clip && i === 0) return toast('Needs a layer below to clip to')
+  updateDoc(d => ({ ...d, layers: d.layers.map(x => (x.id === id ? ({ ...x, clip: !x.clip } as Layer) : x)) }), l.clip ? 'Release clipping mask' : 'Clipping mask')
+}
+
+/** Moves a layer (and its mask) by dx, dy. */
+export function shiftLayer<L extends Layer>(l: L, dx: number, dy: number): L {
+  const mask = l.mask ? { ...l.mask, x: l.mask.x + dx, y: l.mask.y + dy } : l.mask
+  if (l.kind === 'adjust') return { ...l, mask }
+  return { ...l, mask, x: (l as RasterLayer).x + dx, y: (l as RasterLayer).y + dy }
+}
+
+/** Redraws a mask onto a new canvas through a transform (rotate/flip/resize). */
+function remapMask(m: Layer['mask'], w: number, h: number, setup: (g: CanvasRenderingContext2D) => void): Layer['mask'] {
+  if (!m) return m
+  const bmp = newBitmap(w, h, '#000000')
+  const g = ctx2d(bmp.canvas)
+  g.imageSmoothingQuality = 'high'
+  setup(g)
+  g.drawImage(m.bmp.canvas, m.x, m.y)
+  return { ...m, bmp, x: 0, y: 0 }
+}
+
+function withMasks(src: Layer[], out: Layer[], w: number, h: number, setup: (g: CanvasRenderingContext2D) => void): Layer[] {
+  return out.map((l, i) => (src[i].mask ? ({ ...l, mask: remapMask(src[i].mask, w, h, setup) } as Layer) : l))
 }
 
 export function commitPatches(label: string, patches: (Patch | null)[]) {
@@ -437,8 +585,13 @@ export function rotateCanvas(deg: 90 | -90 | 180) {
       g.drawImage(l.bmp.canvas, l.x, l.y)
     })
   })
+  const layersM = withMasks(d.layers, layers, nw, nh, g => {
+    g.translate(nw / 2, nh / 2)
+    g.rotate((deg * Math.PI) / 180)
+    g.translate(-W / 2, -H / 2)
+  })
   const guides = deg === 180 ? { h: d.guides.h.map(y => H - y), v: d.guides.v.map(x => W - x) } : { h: d.guides.v.map(x => (deg === 90 ? x : W - x)), v: d.guides.h.map(y => (deg === 90 ? H - y : y)) }
-  updateDoc(() => ({ ...d, width: nw, height: nh, layers, selection: null, guides }), deg === 180 ? 'Rotate 180°' : deg === 90 ? 'Rotate 90° CW' : 'Rotate 90° CCW')
+  updateDoc(() => ({ ...d, width: nw, height: nh, layers: layersM, selection: null, guides }), deg === 180 ? 'Rotate 180°' : deg === 90 ? 'Rotate 90° CW' : 'Rotate 90° CCW')
   if (rasterized) toast('Text layers were rasterized')
   fitView()
 }
@@ -456,7 +609,10 @@ export function flipCanvas(axis: 'h' | 'v') {
     return flipRaster(l, axis, W, H)
   })
   const guides = axis === 'h' ? { ...d.guides, v: d.guides.v.map(x => W - x) } : { ...d.guides, h: d.guides.h.map(y => H - y) }
-  updateDoc(() => ({ ...d, layers, guides, selection: null }), axis === 'h' ? 'Flip horizontal' : 'Flip vertical')
+  const layersM = withMasks(d.layers, layers, W, H, g => {
+    if (axis === 'h') { g.translate(W, 0); g.scale(-1, 1) } else { g.translate(0, H); g.scale(1, -1) }
+  })
+  updateDoc(() => ({ ...d, layers: layersM, guides, selection: null }), axis === 'h' ? 'Flip horizontal' : 'Flip vertical')
   if (rasterized) toast('Text layers were rasterized')
 }
 
@@ -508,7 +664,8 @@ export function resizeImage(nw: number, nh: number) {
     return l
   })
   const guides = { h: d.guides.h.map(y => y * sy), v: d.guides.v.map(x => x * sx) }
-  updateDoc(() => ({ ...d, width: nw, height: nh, layers, selection: null, guides }), 'Image size')
+  const layersM = withMasks(d.layers, layers, nw, nh, g => g.scale(sx, sy))
+  updateDoc(() => ({ ...d, width: nw, height: nh, layers: layersM, selection: null, guides }), 'Image size')
   fitView()
 }
 
@@ -531,12 +688,11 @@ export function crop(r: Rect, deletePixels: boolean) {
 
 function shiftDoc(d: Doc, nw: number, nh: number, dx: number, dy: number, trim: boolean, label: string) {
   const layers = d.layers.map((l): Layer => {
-    if (l.kind === 'raster') {
-      if (!trim) return { ...l, x: l.x + dx, y: l.y + dy }
-      return mapRaster(l, nw, nh, (g, l) => g.drawImage(l.bmp.canvas, l.x + dx, l.y + dy))
+    if (l.kind === 'raster' && trim) {
+      const r = mapRaster(l, nw, nh, (g, l) => g.drawImage(l.bmp.canvas, l.x + dx, l.y + dy))
+      return { ...r, mask: remapMask(l.mask, nw, nh, g => g.translate(dx, dy)) }
     }
-    if (l.kind === 'text' || l.kind === 'shape') return { ...l, x: l.x + dx, y: l.y + dy }
-    return l
+    return shiftLayer(l, dx, dy)
   })
   let selection: Bitmap | null = null
   if (d.selection) {

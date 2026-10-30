@@ -1,14 +1,17 @@
-import { ctx2d, makeCanvas } from '../core/bitmap'
+import { alphaBounds, ctx2d, makeCanvas } from '../core/bitmap'
 import {
-  addShapeSilent, commitPatches, crop, editableRaster, newShape, selectLayer, setSelection,
+  addShapeSilent, commitPatches, crop, editableRaster, grayOf, rasterOf, newShape, paintTarget, selectLayer, setSelection, shiftLayer,
+  type PaintTarget,
 } from '../core/ops'
-import { compositeDoc, flattenToCanvas, layerBounds, layerSource, shapeBox, textLayout } from '../core/render'
+import { applyAdjustment } from '../core/adjustments'
+import { gaussianBlur, unsharp } from '../core/filters'
+import { compositeDoc, flattenToCanvas, layerBounds, layerSource, shapeBox, textLayout, type LayerSource } from '../core/render'
 import { floodMask, maskBounds, maskFromBytes, maskFromPath, type SelMode } from '../core/selection'
 import {
-  S, activeLayer, commit, editPixels, redrawOverlay, set, setDocSilent, toast, type ToolId,
+  S, activeLayer, commit, editPixels, redrawOverlay, set, setDocSilent, toast, type ToolId, type ToolOptions,
 } from '../core/store'
 import type { Doc, Layer, Pt, RasterLayer, Rect, ShapeLayer, TextLayer } from '../core/types'
-import { panBy, toScreen, zoomStep } from '../core/view'
+import { panBy, toDoc, toScreen, zoomStep } from '../core/view'
 
 export interface PInfo {
   x: number
@@ -89,22 +92,30 @@ function replaceLayer(d: Doc, l: Layer): Doc {
   return { ...d, layers: d.layers.map(x => (x.id === l.id ? l : x)) }
 }
 
-// --- Brush / eraser ------------------------------------------------------------
+// --- Stroke engine: brush, eraser, clone, dodge/burn/sponge, blur/sharpen -----------
+
+type PaintKind = 'brush' | 'eraser' | 'clone' | 'dodge' | 'focus'
 
 interface Stroke {
-  layer: RasterLayer
+  target: PaintTarget
+  kind: PaintKind
+  mode: 'paint' | 'erase' | 'source'
   stroke: HTMLCanvasElement
   work: HTMLCanvasElement
+  /** For 'source' strokes: what gets painted in (clone / toned / blurred copy). */
+  source: HTMLCanvasElement | null
   dab: HTMLCanvasElement
+  color: string
   last: Pt
   bbox: Rect | null
   carry: number
   raf: number
-  erase: boolean
 }
 
 let stroke: Stroke | null = null
 const lastPaint: { pt: Pt | null; layerId: string | null } = { pt: null, layerId: null }
+let cloneSrc: Pt | null = null
+let cloneOff: Pt | null = null
 
 function makeDab(size: number, hardness: number, color: string) {
   const d = Math.max(1, Math.ceil(size))
@@ -150,7 +161,7 @@ function stamp(s: Stroke, from: Pt, to: Pt, size: number) {
     : r
 }
 
-/** Stroke buffer clipped to the selection, in layer space. */
+/** Stroke buffer clipped to the selection, in target space. */
 function maskedStroke(s: Stroke): HTMLCanvasElement {
   const sel = S().doc?.selection
   if (!sel) return s.stroke
@@ -158,24 +169,43 @@ function maskedStroke(s: Stroke): HTMLCanvasElement {
   const g = ctx2d(c)
   g.drawImage(s.stroke, 0, 0)
   g.globalCompositeOperation = 'destination-in'
-  g.drawImage(sel.canvas, -s.layer.x, -s.layer.y)
+  g.drawImage(sel.canvas, -s.target.x, -s.target.y)
   return c
 }
 
 function strokeOpacity(s: Stroke) {
-  return s.erase ? S().opts.eraser.opacity : S().opts.brush.opacity
+  const o = S().opts
+  if (s.kind === 'dodge' || s.kind === 'focus') return 1
+  return o[s.kind].opacity
+}
+
+/** Draws the stroke onto g, which already holds the target's pixels. */
+function applyStroke(s: Stroke, g: CanvasRenderingContext2D) {
+  const m = maskedStroke(s)
+  g.globalAlpha = strokeOpacity(s)
+  if (s.mode === 'source' && s.source) {
+    const t = makeCanvas(m.width, m.height)
+    const tg = ctx2d(t)
+    tg.drawImage(s.source, 0, 0)
+    tg.globalCompositeOperation = 'destination-in'
+    tg.drawImage(m, 0, 0)
+    g.drawImage(t, 0, 0)
+  } else {
+    g.globalCompositeOperation = s.mode === 'erase' ? 'destination-out' : 'source-over'
+    g.drawImage(m, 0, 0)
+  }
+  g.globalAlpha = 1
+  g.globalCompositeOperation = 'source-over'
 }
 
 function renderStroke(s: Stroke) {
   const g = ctx2d(s.work)
   g.globalCompositeOperation = 'copy'
-  g.drawImage(s.layer.bmp.canvas, 0, 0)
-  g.globalCompositeOperation = s.erase ? 'destination-out' : 'source-over'
-  g.globalAlpha = strokeOpacity(s)
-  g.drawImage(maskedStroke(s), 0, 0)
-  g.globalAlpha = 1
+  g.drawImage(s.target.bmp.canvas, 0, 0)
   g.globalCompositeOperation = 'source-over'
-  set({ preview: { layerId: s.layer.id, canvas: s.work, x: s.layer.x, y: s.layer.y } })
+  applyStroke(s, g)
+  const t = s.target
+  set({ preview: t.isMask ? { layerId: t.layer.id, mask: s.work, maskX: t.x, maskY: t.y } : { layerId: t.layer.id, canvas: s.work, x: t.x, y: t.y } })
 }
 
 function schedule(s: Stroke) {
@@ -186,36 +216,91 @@ function schedule(s: Stroke) {
   })
 }
 
-function paintTool(erase: boolean): Tool {
-  const o = () => (erase ? S().opts.eraser : S().opts.brush)
+/** Tone curve for dodge / burn, weighted by tonal range. */
+function toneCanvas(src: HTMLCanvasElement, o: ToolOptions['dodge']): HTMLCanvasElement {
+  const img = ctx2d(src, true).getImageData(0, 0, src.width, src.height)
+  const d = img.data
+  const k = o.strength / 100
+  if (o.mode === 'sponge' || o.mode === 'saturate') {
+    applyAdjustment(d, { type: 'hue', hue: 0, saturation: (o.mode === 'saturate' ? 1 : -1) * k * 100, lightness: 0 })
+  } else {
+    const lut = new Uint8ClampedArray(256)
+    for (let v = 0; v < 256; v++) {
+      const t = v / 255
+      const w = o.range === 'shadows' ? (1 - t) ** 2 : o.range === 'highlights' ? t ** 2 : 1 - Math.abs(t - 0.5) * 2
+      lut[v] = o.mode === 'dodge' ? v + (255 - v) * k * w : v - v * k * w
+    }
+    for (let i = 0; i < d.length; i += 4) {
+      d[i] = lut[d[i]]
+      d[i + 1] = lut[d[i + 1]]
+      d[i + 2] = lut[d[i + 2]]
+    }
+  }
+  const c = makeCanvas(src.width, src.height)
+  ctx2d(c).putImageData(img, 0, 0)
+  return c
+}
+
+function strokeSource(kind: PaintKind, t: PaintTarget, p: PInfo): HTMLCanvasElement | null {
+  const src = t.bmp.canvas
+  if (kind === 'dodge') return toneCanvas(src, S().opts.dodge)
+  if (kind === 'focus') {
+    const o = S().opts.focus
+    const k = o.strength / 100
+    return o.mode === 'blur' ? gaussianBlur(src, 0.5 + k * 6) : unsharp(src, 40 + k * 220, 1, 0)
+  }
+  if (kind === 'clone') {
+    const o = S().opts.clone
+    const off = o.aligned && cloneOff ? cloneOff : { x: cloneSrc!.x - p.x, y: cloneSrc!.y - p.y }
+    cloneOff = off
+    const c = makeCanvas(src.width, src.height)
+    const g = ctx2d(c)
+    if (o.sampleAll) g.drawImage(flattenToCanvas(S().doc!), -t.x - off.x, -t.y - off.y)
+    else g.drawImage(src, -off.x, -off.y)
+    return c
+  }
+  return null
+}
+
+const PAINT_LABEL: Record<PaintKind, string> = { brush: 'Brush', eraser: 'Eraser', clone: 'Clone stamp', dodge: 'Dodge', focus: 'Blur' }
+
+function paintTool(kind: PaintKind): Tool {
+  const o = () => S().opts[kind]
   const sizeAt = (p: PInfo) => Math.max(1, o().size * (p.pen ? Math.max(0.1, p.pressure) : 1))
   return {
     cursor: () => 'none',
     down(p) {
-      const l = editableRaster()
-      if (!l) return
-      const { width: w, height: h } = l.bmp.canvas
-      const color = erase ? '#000000' : S().fg
+      if (kind === 'clone' && p.alt) {
+        cloneSrc = { x: p.x, y: p.y }
+        cloneOff = null
+        toast('Clone source set')
+        return
+      }
+      if (kind === 'clone' && !cloneSrc) return toast('Alt-click to set the clone source')
+      const t = paintTarget()
+      if (!t) return
+      if (t.isMask && (kind === 'clone' || kind === 'dodge' || kind === 'focus')) return toast('This tool works on pixels, not masks')
+      const { width: w, height: h } = t.bmp.canvas
+      const mode = kind === 'brush' ? 'paint' : kind === 'eraser' ? (t.isMask ? 'paint' : 'erase') : 'source'
+      const color = kind === 'brush' ? (t.isMask ? grayOf(S().fg) : S().fg) : kind === 'eraser' && t.isMask ? grayOf(S().bg) : mode === 'erase' ? '#000000' : '#ffffff'
       const s: Stroke = {
-        layer: l, stroke: makeCanvas(w, h), work: makeCanvas(w, h),
-        dab: makeDab(o().size, o().hardness, color), last: { x: p.x - l.x, y: p.y - l.y },
-        bbox: null, carry: 0, raf: 0, erase,
+        target: t, kind, mode, color, stroke: makeCanvas(w, h), work: makeCanvas(w, h),
+        source: mode === 'source' ? strokeSource(kind, t, p) : null,
+        dab: makeDab(o().size, o().hardness, color), last: { x: p.x - t.x, y: p.y - t.y },
+        bbox: null, carry: 0, raf: 0,
       }
       stroke = s
-      const pt = { x: p.x - l.x, y: p.y - l.y }
-      if (p.shift && lastPaint.pt && lastPaint.layerId === l.id) {
-        stamp(s, { x: lastPaint.pt.x, y: lastPaint.pt.y }, pt, o().size)
-      } else {
-        stamp(s, pt, pt, sizeAt(p))
-      }
+      const pt = { x: p.x - t.x, y: p.y - t.y }
+      if (p.shift && lastPaint.pt && lastPaint.layerId === t.layer.id) stamp(s, { x: lastPaint.pt.x, y: lastPaint.pt.y }, pt, o().size)
+      else stamp(s, pt, pt, sizeAt(p))
       s.last = pt
       renderStroke(s)
     },
     move(p) {
       const s = stroke
       if (!s) return
-      const pt = { x: p.x - s.layer.x, y: p.y - s.layer.y }
-      if (p.pen) s.dab = makeDab(sizeAt(p), o().hardness, erase ? '#000000' : S().fg)
+      const pt = { x: p.x - s.target.x, y: p.y - s.target.y }
+      if (p.pen) s.dab = makeDab(sizeAt(p), o().hardness, s.color)
       stamp(s, s.last, pt, sizeAt(p))
       s.last = pt
       schedule(s)
@@ -226,17 +311,11 @@ function paintTool(erase: boolean): Tool {
       if (!s) return
       cancelAnimationFrame(s.raf)
       lastPaint.pt = s.last
-      lastPaint.layerId = s.layer.id
-      const masked = maskedStroke(s)
-      const patch = editPixels(s.layer.bmp, s.bbox, g => {
-        g.globalCompositeOperation = s.erase ? 'destination-out' : 'source-over'
-        g.globalAlpha = strokeOpacity(s)
-        g.drawImage(masked, 0, 0)
-        g.globalAlpha = 1
-        g.globalCompositeOperation = 'source-over'
-      })
+      lastPaint.layerId = s.target.layer.id
+      const patch = editPixels(s.target.bmp, s.bbox, g => applyStroke(s, g))
       set({ preview: null })
-      commitPatches(erase ? 'Eraser' : 'Brush', [patch])
+      const label = kind === 'dodge' ? ({ dodge: 'Dodge', burn: 'Burn', sponge: 'Sponge', saturate: 'Sponge' } as const)[S().opts.dodge.mode] : kind === 'focus' ? (S().opts.focus.mode === 'blur' ? 'Blur' : 'Sharpen') : PAINT_LABEL[kind]
+      commitPatches(s.target.isMask ? `${label} (mask)` : label, [patch])
     },
     hover() {
       redrawOverlay()
@@ -265,6 +344,21 @@ function paintTool(erase: boolean): Tool {
       if (r < 4 * dpr) {
         g.fillStyle = '#fff'
         g.fillRect(sx - dpr, sy - dpr, 2 * dpr, 2 * dpr)
+      }
+      if (kind === 'clone' && cloneSrc) {
+        // Where pixels are sampled from.
+        const off = cloneOff ?? { x: cloneSrc.x - hover.x, y: cloneSrc.y - hover.y }
+        const at = stroke || (S().opts.clone.aligned && cloneOff) ? toScreen(hover.x + off.x, hover.y + off.y) : toScreen(cloneSrc.x, cloneSrc.y)
+        const cx = at.x * dpr, cy = at.y * dpr, k = 7 * dpr
+        g.beginPath()
+        g.moveTo(cx - k, cy); g.lineTo(cx + k, cy)
+        g.moveTo(cx, cy - k); g.lineTo(cx, cy + k)
+        g.lineWidth = 3 * dpr
+        g.strokeStyle = 'rgba(0,0,0,.6)'
+        g.stroke()
+        g.lineWidth = 1.5 * dpr
+        g.strokeStyle = ACCENT
+        g.stroke()
       }
     },
   }
@@ -469,17 +563,23 @@ const bucket: Tool = {
   down(p) {
     const d = S().doc
     if (!d) return
-    const l = editableRaster()
+    const l = paintTarget()
     if (!l) return
     const doc = S().doc!
     const o = S().opts.bucket
     const x = Math.floor(p.x), y = Math.floor(p.y)
     if (x < 0 || y < 0 || x >= doc.width || y >= doc.height) return
-    const bytes = floodMask(sampleSource(doc, o.sampleAll), x, y, o.tolerance, o.contiguous)
+    let srcImg: ImageData
+    if (l.isMask) {
+      const mc = makeCanvas(doc.width, doc.height)
+      ctx2d(mc).drawImage(l.bmp.canvas, l.x, l.y)
+      srcImg = ctx2d(mc, true).getImageData(0, 0, doc.width, doc.height)
+    } else srcImg = sampleSource(doc, o.sampleAll)
+    const bytes = floodMask(srcImg, x, y, o.tolerance, o.contiguous)
     const mask = maskFromBytes(doc.width, doc.height, bytes, true)
     const fill = makeCanvas(doc.width, doc.height)
     const fg = ctx2d(fill)
-    fg.fillStyle = S().fg
+    fg.fillStyle = l.isMask ? grayOf(S().fg) : S().fg
     fg.fillRect(0, 0, doc.width, doc.height)
     fg.globalCompositeOperation = 'destination-in'
     fg.drawImage(mask.canvas, 0, 0)
@@ -493,13 +593,14 @@ const bucket: Tool = {
 
 // --- Gradient ---------------------------------------------------------------------
 
-let grad: { layer: RasterLayer; a: Pt; b: Pt; work: HTMLCanvasElement } | null = null
+let grad: { layer: PaintTarget; a: Pt; b: Pt; work: HTMLCanvasElement } | null = null
 
-function gradientCanvas(d: Doc, a: Pt, b: Pt): HTMLCanvasElement {
+function gradientCanvas(d: Doc, a: Pt, b: Pt, gray = false): HTMLCanvasElement {
   const o = S().opts.gradient
   const c = makeCanvas(d.width, d.height)
   const g = ctx2d(c)
-  const fg = S().fg, bg = o.toTransparent ? S().fg + '00' : S().bg
+  const f0 = gray ? grayOf(S().fg) : S().fg
+  const fg = f0, bg = o.toTransparent ? f0 + '00' : gray ? grayOf(S().bg) : S().bg
   const gr = o.type === 'linear'
     ? g.createLinearGradient(a.x, a.y, b.x, b.y)
     : g.createRadialGradient(a.x, a.y, 0, a.x, a.y, Math.max(1, Math.hypot(b.x - a.x, b.y - a.y)))
@@ -517,7 +618,7 @@ function gradientCanvas(d: Doc, a: Pt, b: Pt): HTMLCanvasElement {
 const gradient: Tool = {
   cursor: () => 'crosshair',
   down(p) {
-    const l = editableRaster()
+    const l = paintTarget()
     if (!l) return
     grad = { layer: l, a: { x: p.x, y: p.y }, b: { x: p.x, y: p.y }, work: makeCanvas(l.bmp.canvas.width, l.bmp.canvas.height) }
   },
@@ -538,8 +639,9 @@ const gradient: Tool = {
     g.globalCompositeOperation = 'copy'
     g.drawImage(grad.layer.bmp.canvas, 0, 0)
     g.globalCompositeOperation = 'source-over'
-    g.drawImage(gradientCanvas(d, grad.a, grad.b), -grad.layer.x, -grad.layer.y)
-    set({ preview: { layerId: grad.layer.id, canvas: grad.work, x: grad.layer.x, y: grad.layer.y } })
+    g.drawImage(gradientCanvas(d, grad.a, grad.b, grad.layer.isMask), -grad.layer.x, -grad.layer.y)
+    const t = grad.layer
+    set({ preview: t.isMask ? { layerId: t.layer.id, mask: grad.work, maskX: t.x, maskY: t.y } : { layerId: t.layer.id, canvas: grad.work, x: t.x, y: t.y } })
     redrawOverlay()
   },
   up() {
@@ -549,7 +651,7 @@ const gradient: Tool = {
     redrawOverlay()
     if (!gr || Math.hypot(gr.b.x - gr.a.x, gr.b.y - gr.a.y) < 1) return
     const d = S().doc!
-    const c = gradientCanvas(d, gr.a, gr.b)
+    const c = gradientCanvas(d, gr.a, gr.b, gr.layer.isMask)
     const sel = d.selection && maskBounds(d.selection)
     const rect = sel ? { x: sel.x - gr.layer.x, y: sel.y - gr.layer.y, w: sel.w, h: sel.h } : { x: -gr.layer.x, y: -gr.layer.y, w: d.width, h: d.height }
     const patch = editPixels(gr.layer.bmp, rect, g => g.drawImage(c, -gr.layer.x, -gr.layer.y))
@@ -610,6 +712,27 @@ let mv: {
   dy: number
 } | null = null
 
+let snapLines: { h: number[]; v: number[] } | null = null
+
+/** Snaps a moving box's edges/center to the canvas edges/center and guides. */
+function snapDelta(b: Rect, dx: number, dy: number, d: Doc): { dx: number; dy: number } {
+  const tol = 6 / S().view.zoom
+  const xs = [0, d.width / 2, d.width, ...d.guides.v]
+  const ys = [0, d.height / 2, d.height, ...d.guides.h]
+  const pick = (edges: number[], targets: number[]) => {
+    let best: { delta: number; at: number } | null = null
+    for (const e of edges) for (const t of targets) {
+      const delta = t - e
+      if (Math.abs(delta) <= tol && (!best || Math.abs(delta) < Math.abs(best.delta))) best = { delta, at: t }
+    }
+    return best
+  }
+  const sx = pick([b.x + dx, b.x + dx + b.w / 2, b.x + dx + b.w], xs)
+  const sy = pick([b.y + dy, b.y + dy + b.h / 2, b.y + dy + b.h], ys)
+  snapLines = { v: sx ? [sx.at] : [], h: sy ? [sy.at] : [] }
+  return { dx: Math.round(dx + (sx?.delta ?? 0)), dy: Math.round(dy + (sy?.delta ?? 0)) }
+}
+
 function nudge(dx: number, dy: number) {
   const d = S().doc
   const l = activeLayer()
@@ -619,7 +742,7 @@ function nudge(dx: number, dy: number) {
     dropFloat(l, d, f, dx, dy)
     return
   }
-  setDocSilent(replaceLayer(d, { ...l, x: (l as RasterLayer).x + dx, y: (l as RasterLayer).y + dy } as Layer))
+  setDocSilent(replaceLayer(d, shiftLayer(l, dx, dy)))
   commit('Nudge')
 }
 
@@ -697,12 +820,20 @@ const move: Tool = {
       redrawOverlay()
       return
     }
-    const o = mv.orig as RasterLayer
-    setDocSilent(replaceLayer(mv.base, { ...o, x: o.x + dx, y: o.y + dy }))
+    if (S().opts.move.snap && !p.ctrl) {
+      const sn = snapDelta(layerBounds(mv.orig, mv.base), dx, dy, mv.base)
+      dx = sn.dx
+      dy = sn.dy
+      mv.dx = dx
+      mv.dy = dy
+    }
+    setDocSilent(replaceLayer(mv.base, shiftLayer(mv.orig, dx, dy)))
+    redrawOverlay()
   },
   up() {
     const m = mv
     mv = null
+    snapLines = null
     if (!m) return
     set({ preview: null })
     if (!m.dx && !m.dy) {
@@ -723,6 +854,14 @@ const move: Tool = {
   overlay(g, dpr) {
     const d = S().doc
     const l = activeLayer()
+    if (snapLines && mv) {
+      g.strokeStyle = '#ffffff'
+      g.lineWidth = dpr
+      g.beginPath()
+      for (const x of snapLines.v) { const s = toScreen(x, 0); g.moveTo(Math.round(s.x * dpr) + 0.5, 0); g.lineTo(Math.round(s.x * dpr) + 0.5, g.canvas.height) }
+      for (const y of snapLines.h) { const s = toScreen(0, y); g.moveTo(0, Math.round(s.y * dpr) + 0.5); g.lineTo(g.canvas.width, Math.round(s.y * dpr) + 0.5) }
+      g.stroke()
+    }
     if (!d || !l || l.kind === 'adjust' || d.selection) return
     let b = layerBounds(l, d)
     if (l.kind === 'raster') {
@@ -1032,11 +1171,256 @@ const zoom: Tool = {
   down(p) { zoomStep(p.alt ? -1 : 1, p.sx, p.sy) },
 }
 
+// --- Free transform ------------------------------------------------------------------
+
+type XHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'move' | 'rotate'
+
+interface Xf {
+  layer: Layer
+  prevTool: ToolId
+  src: LayerSource
+  box: Rect
+  cx: number
+  cy: number
+  w: number
+  h: number
+  rot: number
+  drag?: { handle: XHandle; q0: Pt; cx: number; cy: number; w: number; h: number; rot: number }
+}
+
+let xf: Xf | null = null
+const UNIT: Record<string, [number, number]> = { nw: [-1, -1], n: [0, -1], ne: [1, -1], e: [1, 0], se: [1, 1], s: [0, 1], sw: [-1, 1], w: [-1, 0] }
+
+function xfMatrix(t: Xf): DOMMatrix {
+  return new DOMMatrix()
+    .translate(t.cx, t.cy)
+    .rotate((t.rot * 180) / Math.PI)
+    .scale(t.w / t.box.w, t.h / t.box.h)
+    .translate(-(t.box.x + t.box.w / 2), -(t.box.y + t.box.h / 2))
+}
+
+function xfCorner(t: Xf, ux: number, uy: number): Pt {
+  const lx = (ux * t.w) / 2, ly = (uy * t.h) / 2
+  const c = Math.cos(t.rot), s = Math.sin(t.rot)
+  return { x: t.cx + lx * c - ly * s, y: t.cy + lx * s + ly * c }
+}
+
+export function transformState() {
+  return xf ? { sx: xf.w / xf.box.w, sy: xf.h / xf.box.h, rot: (xf.rot * 180) / Math.PI } : null
+}
+
+export function setTransformState(p: { sx?: number; sy?: number; rot?: number }) {
+  if (!xf) return
+  if (p.sx !== undefined) xf.w = xf.box.w * p.sx
+  if (p.sy !== undefined) xf.h = xf.box.h * p.sy
+  if (p.rot !== undefined) xf.rot = (p.rot * Math.PI) / 180
+  xfPreview()
+}
+
+function xfPreview() {
+  const t = xf
+  const d = S().doc
+  if (!t || !d) return
+  const c = makeCanvas(d.width, d.height)
+  const g = ctx2d(c)
+  g.imageSmoothingQuality = 'high'
+  g.setTransform(xfMatrix(t))
+  g.drawImage(t.src.src, t.src.x, t.src.y)
+  let mask: HTMLCanvasElement | undefined
+  if (t.layer.mask) {
+    mask = makeCanvas(d.width, d.height)
+    const mg = ctx2d(mask)
+    mg.fillStyle = '#000'
+    mg.fillRect(0, 0, d.width, d.height)
+    mg.setTransform(xfMatrix(t))
+    mg.drawImage(t.layer.mask.bmp.canvas, t.layer.mask.x, t.layer.mask.y)
+  }
+  set({ preview: { layerId: t.layer.id, canvas: c, x: 0, y: 0, mask, maskX: 0, maskY: 0 } })
+  redrawOverlay()
+}
+
+export function beginTransform() {
+  const d = S().doc
+  const l = activeLayer()
+  if (!d || !l) return
+  if (l.kind === 'adjust') return toast('Pick a pixel, text or shape layer')
+  if (l.locked) return toast('Layer is locked')
+  if (xf) return
+  const src = layerSource(l)
+  if (!src) return
+  let box: Rect
+  if (l.kind === 'raster') {
+    const b = alphaBounds(l.bmp.canvas)
+    if (!b) return toast('Layer is empty')
+    box = { x: b.x + l.x, y: b.y + l.y, w: b.w, h: b.h }
+  } else box = layerBounds(l, d)
+  box = { ...box, w: Math.max(1, box.w), h: Math.max(1, box.h) }
+  xf = { layer: l, prevTool: S().tool === 'transform' ? 'move' : S().tool, src, box, cx: box.x + box.w / 2, cy: box.y + box.h / 2, w: box.w, h: box.h, rot: 0 }
+  set({ tool: 'transform' })
+  xfPreview()
+}
+
+export function endTransform(apply: boolean) {
+  const t = xf
+  xf = null
+  set({ preview: null })
+  if (S().tool === 'transform') set({ tool: t?.prevTool ?? 'move' })
+  redrawOverlay()
+  if (!t || !apply) return
+  const d = S().doc!
+  const sx = t.w / t.box.w, sy = t.h / t.box.h
+  const M = xfMatrix(t)
+  const unchanged = Math.abs(sx - 1) < 1e-4 && Math.abs(sy - 1) < 1e-4 && Math.abs(t.rot) < 1e-4 && Math.abs(t.cx - (t.box.x + t.box.w / 2)) < 1e-3 && Math.abs(t.cy - (t.box.y + t.box.h / 2)) < 1e-3
+  if (unchanged) return
+  const noRot = Math.abs(t.rot) < 1e-4
+  let nl: Layer | null = null
+  const l = t.layer
+  if (l.kind === 'shape' && (l.shape === 'line' || noRot)) {
+    const a = M.transformPoint(new DOMPoint(l.x, l.y)), b = M.transformPoint(new DOMPoint(l.x + l.w, l.y + l.h))
+    nl = l.shape === 'line'
+      ? { ...l, x: a.x, y: a.y, w: b.x - a.x, h: b.y - a.y }
+      : { ...l, x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), w: Math.abs(b.x - a.x), h: Math.abs(b.y - a.y), radius: l.radius * Math.min(Math.abs(sx), Math.abs(sy)) }
+  } else if (l.kind === 'text' && noRot && Math.abs(sx - sy) < 0.01 && sx > 0) {
+    const tl = M.transformPoint(new DOMPoint(t.box.x, t.box.y))
+    const w = t.box.w * sx
+    nl = { ...l, size: l.size * sx, x: l.align === 'left' ? tl.x : l.align === 'center' ? tl.x + w / 2 : tl.x + w, y: tl.y }
+  } else {
+    const r = rasterOf(l, d)
+    const src = r === l ? t.src : { src: r.bmp.canvas, x: r.x, y: r.y }
+    const pts = [[src.x, src.y], [src.x + src.src.width, src.y], [src.x, src.y + src.src.height], [src.x + src.src.width, src.y + src.src.height]].map(([x, y]) => M.transformPoint(new DOMPoint(x, y)))
+    const bx = Math.floor(Math.min(...pts.map(p => p.x))), by = Math.floor(Math.min(...pts.map(p => p.y)))
+    const bw = Math.ceil(Math.max(...pts.map(p => p.x))) - bx, bh = Math.ceil(Math.max(...pts.map(p => p.y))) - by
+    const c = makeCanvas(Math.min(16384, bw), Math.min(16384, bh))
+    const g = ctx2d(c)
+    g.imageSmoothingQuality = 'high'
+    g.setTransform(new DOMMatrix().translate(-bx, -by).multiply(M))
+    g.drawImage(src.src, src.x, src.y)
+    nl = { ...r, bmp: { id: `bmp_xf${Date.now().toString(36)}`, canvas: c }, x: bx, y: by }
+    if (l.kind === 'text' || l.kind === 'shape') toast(`${l.kind === 'text' ? 'Text' : 'Shape'} was rasterized to rotate it`)
+  }
+  if (l.mask && nl) {
+    const m = makeCanvas(d.width, d.height)
+    const mg = ctx2d(m)
+    mg.fillStyle = '#000'
+    mg.fillRect(0, 0, d.width, d.height)
+    mg.setTransform(M)
+    mg.drawImage(l.mask.bmp.canvas, l.mask.x, l.mask.y)
+    nl = { ...nl, mask: { ...l.mask, bmp: { id: `bmp_m${Date.now().toString(36)}`, canvas: m }, x: 0, y: 0 } } as Layer
+  }
+  setDocSilent(replaceLayer(S().doc!, nl!))
+  commit('Free transform')
+}
+
+function xfHandleAt(sx: number, sy: number): XHandle {
+  if (!xf) return 'move'
+  for (const [h, [ux, uy]] of Object.entries(UNIT)) {
+    const p = xfCorner(xf, ux, uy)
+    const s = toScreen(p.x, p.y)
+    if (Math.abs(s.x - sx) < 8 && Math.abs(s.y - sy) < 8) return h as XHandle
+  }
+  // Inside the (rotated) box?
+  const d = toDoc(sx, sy)
+  const c = Math.cos(-xf.rot), s = Math.sin(-xf.rot)
+  const lx = (d.x - xf.cx) * c - (d.y - xf.cy) * s, ly = (d.x - xf.cx) * s + (d.y - xf.cy) * c
+  return Math.abs(lx) <= Math.abs(xf.w) / 2 && Math.abs(ly) <= Math.abs(xf.h) / 2 ? 'move' : 'rotate'
+}
+
+const ROTATE_CURSOR = `url("data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M5 12a7 7 0 1 0 2.1-5" fill="none" stroke="#000" stroke-width="4" stroke-linecap="round"/><path d="M5 12a7 7 0 1 0 2.1-5" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"/><path d="M4 3v5h5" fill="none" stroke="#000" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 3v5h5" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>')}") 12 12, crosshair`
+const XCURSORS: Record<XHandle, string> = { nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize', n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize', move: 'move', rotate: ROTATE_CURSOR }
+
+const transform: Tool = {
+  cursor: p => (p ? XCURSORS[xfHandleAt(p.sx, p.sy)] : 'default'),
+  activate() {
+    if (!xf) beginTransform()
+  },
+  deactivate() {
+    if (xf) endTransform(true)
+  },
+  down(p) {
+    if (!xf) return
+    if (p.dbl && xfHandleAt(p.sx, p.sy) === 'move') return endTransform(true)
+    xf.drag = { handle: xfHandleAt(p.sx, p.sy), q0: { x: p.x, y: p.y }, cx: xf.cx, cy: xf.cy, w: xf.w, h: xf.h, rot: xf.rot }
+  },
+  move(p) {
+    const t = xf
+    const dr = t?.drag
+    if (!t || !dr) return
+    if (dr.handle === 'move') {
+      t.cx = dr.cx + p.x - dr.q0.x
+      t.cy = dr.cy + p.y - dr.q0.y
+    } else if (dr.handle === 'rotate') {
+      let r = dr.rot + Math.atan2(p.y - dr.cy, p.x - dr.cx) - Math.atan2(dr.q0.y - dr.cy, dr.q0.x - dr.cx)
+      if (p.shift) r = Math.round(r / (Math.PI / 12)) * (Math.PI / 12)
+      t.rot = r
+    } else {
+      const [ux, uy] = UNIT[dr.handle]
+      const start = { ...t, cx: dr.cx, cy: dr.cy, w: dr.w, h: dr.h, rot: dr.rot }
+      const opp = xfCorner(start, -ux, -uy)
+      const c = Math.cos(-dr.rot), s = Math.sin(-dr.rot)
+      const dx = (p.x - opp.x) * c - (p.y - opp.y) * s, dy = (p.x - opp.x) * s + (p.y - opp.y) * c
+      let w = ux ? dx / ux : dr.w, h = uy ? dy / uy : dr.h
+      // Corners keep proportions unless Shift is held (shapes: the other way round).
+      const keep = ux && uy && (p.shift === (t.layer.kind === 'shape'))
+      if (keep) {
+        const kx = w / dr.w, ky = h / dr.h
+        const k = Math.abs(kx) > Math.abs(ky) ? Math.abs(kx) : Math.abs(ky)
+        w = dr.w * k * Math.sign(kx || 1)
+        h = dr.h * k * Math.sign(ky || 1)
+      }
+      if (Math.abs(w) < 1) w = Math.sign(w || 1)
+      if (Math.abs(h) < 1) h = Math.sign(h || 1)
+      const cr = Math.cos(dr.rot), sr = Math.sin(dr.rot)
+      const lx = (ux * w) / 2, ly = (uy * h) / 2
+      if (ux && uy) { t.cx = opp.x + lx * cr - ly * sr; t.cy = opp.y + lx * sr + ly * cr }
+      else if (ux) { const o = xfCorner(start, -ux, 0); t.cx = o.x + lx * cr; t.cy = o.y + lx * sr }
+      else { const o = xfCorner(start, 0, -uy); t.cx = o.x - ly * sr; t.cy = o.y + ly * cr }
+      t.w = w
+      t.h = h
+    }
+    xfPreview()
+  },
+  up() {
+    if (xf) xf.drag = undefined
+  },
+  key(e) {
+    if (!xf) return false
+    if (e.key === 'Enter') { endTransform(true); return true }
+    if (e.key === 'Escape' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z')) { endTransform(false); return true }
+    return false
+  },
+  overlay(g, dpr) {
+    if (!xf) return
+    const pts = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([ux, uy]) => toScreen(xfCorner(xf!, ux, uy).x, xfCorner(xf!, ux, uy).y))
+    g.beginPath()
+    pts.forEach((p, i) => (i ? g.lineTo(p.x * dpr, p.y * dpr) : g.moveTo(p.x * dpr, p.y * dpr)))
+    g.closePath()
+    g.lineWidth = 1.5 * dpr
+    g.strokeStyle = 'rgba(0,0,0,.5)'
+    g.stroke()
+    g.lineWidth = dpr
+    g.strokeStyle = ACCENT
+    g.stroke()
+    const hs = 8 * dpr
+    for (const [ux, uy] of Object.values(UNIT)) {
+      const p = toScreen(xfCorner(xf, ux, uy).x, xfCorner(xf, ux, uy).y)
+      g.fillStyle = '#0b0b0c'
+      g.fillRect(p.x * dpr - hs / 2, p.y * dpr - hs / 2, hs, hs)
+      g.strokeStyle = ACCENT
+      g.strokeRect(p.x * dpr - hs / 2, p.y * dpr - hs / 2, hs, hs)
+    }
+    const c = toScreen(xf.cx, xf.cy)
+    g.beginPath()
+    g.arc(c.x * dpr, c.y * dpr, 3 * dpr, 0, Math.PI * 2)
+    g.strokeStyle = ACCENT
+    g.stroke()
+  },
+}
+
 // --- Registry --------------------------------------------------------------------------------
 
 export const TOOLS: Record<ToolId, Tool> = {
   move, marquee, lasso, wand, crop: cropTool, eyedropper,
-  brush: paintTool(false), eraser: paintTool(true), bucket, gradient, text, shape, hand, zoom,
+  brush: paintTool('brush'), eraser: paintTool('eraser'), clone: paintTool('clone'), dodge: paintTool('dodge'), focus: paintTool('focus'), bucket, gradient, text, shape, hand, zoom, transform,
 }
 
 export function setHover(p: PInfo | null) {
@@ -1048,5 +1432,5 @@ export function getHover() {
 }
 
 export function isToolBusy() {
-  return !!(stroke || marq || mv || grad || shp || cropDrag || handLast || (lassoPts && !polyActive))
+  return !!(stroke || marq || mv || grad || shp || cropDrag || handLast || (lassoPts && !polyActive) || xf?.drag)
 }

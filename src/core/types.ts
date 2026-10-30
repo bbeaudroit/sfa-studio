@@ -28,6 +28,24 @@ export interface Bitmap {
   canvas: HTMLCanvasElement
 }
 
+/** Grayscale mask in doc space: white shows the layer, black hides it. */
+export interface LayerMask {
+  bmp: Bitmap
+  x: number
+  y: number
+  enabled: boolean
+}
+
+export interface ShadowFx { on: boolean; color: string; opacity: number; angle: number; distance: number; size: number }
+export interface GlowFx { on: boolean; color: string; opacity: number; size: number }
+export interface StrokeFx { on: boolean; color: string; opacity: number; size: number }
+
+export interface LayerFx {
+  shadow?: ShadowFx
+  glow?: GlowFx
+  stroke?: StrokeFx
+}
+
 interface LayerBase {
   id: string
   name: string
@@ -35,6 +53,10 @@ interface LayerBase {
   locked: boolean
   opacity: number
   blend: BlendMode
+  mask?: LayerMask | null
+  /** Clipped to the layer below (clipping mask). */
+  clip?: boolean
+  fx?: LayerFx
 }
 
 export interface RasterLayer extends LayerBase {

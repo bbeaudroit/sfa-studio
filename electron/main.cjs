@@ -5,7 +5,7 @@ const fs = require('node:fs/promises')
 const fss = require('node:fs')
 
 const DEV_URL = process.env.VITE_DEV_SERVER_URL
-const OPENABLE = /\.(png|jpe?g|webp|gif|bmp|avif|sfas)$/i
+const OPENABLE = /\.(png|jpe?g|webp|gif|bmp|avif|psd|sfas)$/i
 
 let win = null
 let dirty = false

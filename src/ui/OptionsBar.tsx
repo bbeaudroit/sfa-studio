@@ -2,9 +2,9 @@ import { AlignCenter, AlignLeft, AlignRight, ArrowLeftRight, Check as CheckIcon,
 import { useEffect, useState, type ReactNode } from 'react'
 import { TOOL_DEFS } from '../commands'
 import { setOpt, useStore } from '../core/store'
-import { applyCrop, cropSize, resetCrop } from '../tools/tools'
+import { applyCrop, cropSize, endTransform, resetCrop, setTransformState, transformState } from '../tools/tools'
 import { FONTS, useFonts } from './fonts'
-import { Check, Segmented, Select, Slider, Btn } from './kit'
+import { Check, NumField, Segmented, Select, Slider, Btn } from './kit'
 import { ToolIcon } from './Toolbar'
 
 const MODES = [
@@ -66,6 +66,39 @@ function ToolOptions({ tool, o }: { tool: string; o: ReturnType<typeof useStore.
         </Group>
       )
     }
+    case 'clone':
+      return (
+        <Group>
+          <Slider label="Size" value={o.clone.size} min={1} max={500} onChange={v => setOpt('clone', { size: v })} unit="px" className="w-52" />
+          <Slider label="Hardness" value={Math.round(o.clone.hardness * 100)} min={0} max={100} onChange={v => setOpt('clone', { hardness: v / 100 })} unit="%" className="w-52" />
+          <Slider label="Opacity" value={Math.round(o.clone.opacity * 100)} min={1} max={100} onChange={v => setOpt('clone', { opacity: v / 100 })} unit="%" className="w-52" />
+          <Check label="Aligned" checked={o.clone.aligned} onChange={v => setOpt('clone', { aligned: v })} tip="Keep the same offset between strokes" />
+          <Check label="All layers" checked={o.clone.sampleAll} onChange={v => setOpt('clone', { sampleAll: v })} />
+          <span className="text-ink-400">Alt-click sets the source</span>
+        </Group>
+      )
+    case 'dodge':
+      return (
+        <Group>
+          <Segmented value={o.dodge.mode} onChange={v => setOpt('dodge', { mode: v })} options={[{ id: 'dodge', label: 'Dodge', tip: 'Lighten' }, { id: 'burn', label: 'Burn', tip: 'Darken' }, { id: 'sponge', label: 'Desaturate' }, { id: 'saturate', label: 'Saturate' }]} />
+          {(o.dodge.mode === 'dodge' || o.dodge.mode === 'burn') && (
+            <Segmented value={o.dodge.range} onChange={v => setOpt('dodge', { range: v })} options={[{ id: 'shadows', label: 'Shadows' }, { id: 'midtones', label: 'Midtones' }, { id: 'highlights', label: 'Highlights' }]} />
+          )}
+          <Slider label="Strength" value={o.dodge.strength} min={1} max={100} onChange={v => setOpt('dodge', { strength: v })} unit="%" className="w-52" />
+          <Slider label="Size" value={o.dodge.size} min={1} max={500} onChange={v => setOpt('dodge', { size: v })} unit="px" className="w-52" />
+        </Group>
+      )
+    case 'focus':
+      return (
+        <Group>
+          <Segmented value={o.focus.mode} onChange={v => setOpt('focus', { mode: v })} options={[{ id: 'blur', label: 'Blur' }, { id: 'sharpen', label: 'Sharpen' }]} />
+          <Slider label="Strength" value={o.focus.strength} min={1} max={100} onChange={v => setOpt('focus', { strength: v })} unit="%" className="w-52" />
+          <Slider label="Size" value={o.focus.size} min={1} max={500} onChange={v => setOpt('focus', { size: v })} unit="px" className="w-52" />
+          <Slider label="Hardness" value={Math.round(o.focus.hardness * 100)} min={0} max={100} onChange={v => setOpt('focus', { hardness: v / 100 })} unit="%" className="w-52" />
+        </Group>
+      )
+    case 'transform':
+      return <TransformOptions />
     case 'marquee':
       return (
         <Group>
@@ -127,6 +160,7 @@ function ToolOptions({ tool, o }: { tool: string; o: ReturnType<typeof useStore.
       return (
         <Group>
           <Check label="Auto-select layer" checked={o.move.autoSelect} onChange={v => setOpt('move', { autoSelect: v })} tip="Click picks the layer under the cursor (Ctrl toggles)" />
+          <Check label="Snap" checked={o.move.snap} onChange={v => setOpt('move', { snap: v })} tip="Snap to canvas edges, center and guides" />
           <span className="text-ink-400">Arrows nudge · Shift ×10 · drag rulers for guides</span>
         </Group>
       )
@@ -158,6 +192,24 @@ function CropOptions() {
       <Sep />
       <Btn onClick={resetCrop}><X size={14} /> Reset</Btn>
       <Btn primary onClick={applyCrop}><CheckIcon size={14} /> Crop</Btn>
+      <span className="text-ink-400">Enter</span>
+    </Group>
+  )
+}
+
+function TransformOptions() {
+  useStore(s => s.overlayVer)
+  const t = transformState()
+  if (!t) return null
+  return (
+    <Group>
+      <NumField label="W" value={Math.round(t.sx * 1000) / 10} suffix="%" onChange={v => setTransformState({ sx: v / 100 })} className="w-24" />
+      <NumField label="H" value={Math.round(t.sy * 1000) / 10} suffix="%" onChange={v => setTransformState({ sy: v / 100 })} className="w-24" />
+      <NumField label="∠" value={Math.round(t.rot * 10) / 10} suffix="°" onChange={v => setTransformState({ rot: v })} className="w-24" />
+      <span className="text-ink-400">Drag corners to scale · outside to rotate · Shift snaps</span>
+      <Sep />
+      <Btn onClick={() => endTransform(false)}><X size={14} /> Cancel</Btn>
+      <Btn primary onClick={() => endTransform(true)}><CheckIcon size={14} /> Apply</Btn>
       <span className="text-ink-400">Enter</span>
     </Group>
   )

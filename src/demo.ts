@@ -78,6 +78,27 @@ export function loadDemo(variant = '') {
     commit('Elliptical marquee')
     set({ tool: 'marquee' })
   }
+  if (variant === 'fx') {
+    const d = S().doc!
+    // Mask the ridges with a soft vertical fade and give the title effects.
+    const m = newBitmap(W, H)
+    const mg = ctx2d(m.canvas)
+    const fade = mg.createLinearGradient(0, 560, 0, 760)
+    fade.addColorStop(0, '#000')
+    fade.addColorStop(1, '#fff')
+    mg.fillStyle = fade
+    mg.fillRect(0, 0, W, H)
+    setDocSilent({
+      ...d,
+      activeId: title.id,
+      layers: d.layers.map(l =>
+        l.id === hillLayer.id ? { ...l, mask: { bmp: m, x: 0, y: 0, enabled: true } }
+          : l.id === title.id ? { ...l, fx: { shadow: { on: true, color: '#1b0f2e', opacity: 0.7, angle: 120, distance: 10, size: 24 }, stroke: { on: true, color: '#C6FF3D', opacity: 1, size: 3 } } }
+            : l),
+    })
+    commit('Layer style')
+    set({ tool: 'move' })
+  }
   if (variant === 'brush') set({ tool: 'brush' })
   if (variant === 'curves') set({ tool: 'move' })
   try { localStorage.setItem('sfa.studio.hint.v1', '1') } catch { /* ignore */ }
